@@ -56,7 +56,7 @@ namespace VertexFormat {
     struct PositionColorNormal {
         T_VEC3 position;
         T_UINT color;
-        T_UINT normal; // first 3 bytes
+        T_UINT normal;
     };
 
     struct PositionTex {
@@ -88,7 +88,7 @@ namespace VertexFormat {
         T_VEC3 position;
         T_VEC2 uv0;
         T_UINT color;
-        T_UINT normal; // first 3 bytes
+        T_UINT normal;
     };
 
     struct PositionTexLightColor {
@@ -101,47 +101,81 @@ namespace VertexFormat {
     struct PositionColorTexLightNormal {
         T_VEC3 position;
         T_UINT color;
-        T_VEC2 uv0;    // texture
-        T_UINT uv2;    // lightmap
-        T_UINT normal; // first 3 bytes
+        T_VEC2 uv0;
+        T_UINT uv2;
+        T_UINT normal;
     };
 
     struct PositionColorTexOverlayLightNormal {
         T_VEC3 position;
         T_UINT color;
-        T_VEC2 uv0;    // texture
-        T_UINT uv1;    // overlay
-        T_UINT uv2;    // lightmap
-        T_UINT normal; // first 3 bytes
+        T_VEC2 uv0;
+        T_UINT uv1;
+        T_UINT uv2;
+        T_UINT normal;
     };
 
-    struct PBRVertex {
+    struct EntityPBRVertex {
         T_VEC3 pos;
-        T_UINT useNorm;
+        T_UINT normalOct;
 
-        T_VEC3 norm;
-        T_UINT useColorLayer;
-
-        T_VEC4 colorLayer;
-
-        T_UINT useTexture;
-        T_UINT useOverlay;
         T_VEC2 textureUV;
+        T_UINT colorRGBA8;
+        T_UINT lightUV;
 
-        T_IVEC2 overlayUV;
-        T_UINT useGlint;
+        T_UINT overlayUV;
+        T_UINT glintUVHalf;
         T_UINT textureID;
-
-        T_VEC2 glintUV;
         T_UINT glintTexture;
-        T_UINT useLight;
-
-        T_IVEC2 lightUV;
-        T_UINT coordinate;
-        T_FLOAT albedoEmission;
 
         T_VEC3 postBase;
-        T_UINT alphaMode;
+        T_UINT packedData;
+    };
+
+    struct EntityInstanceMaterial {
+        T_VEC4 color;
+        T_VEC4 uvTransform;
+        T_UINT light;
+        T_UINT overlay;
+        T_UINT flags;
+        T_UINT pad;
+    };
+
+    struct EntityGeometryHeader {
+        T_UINT addressLo;
+        T_UINT addressHi;
+        T_UINT addressIndex;
+        T_UINT pad;
+        EntityInstanceMaterial material;
+    };
+
+    struct EntityGeometryInstance {
+        T_UINT addressLo;
+        T_UINT addressHi;
+        T_UINT addressIndex;
+        T_UINT pad;
+        EntityInstanceMaterial material;
+        T_UINT rawAddressLo;
+        T_UINT rawAddressHi;
+        T_UINT rawPad0;
+        T_UINT rawPad1;
+        T_VEC4 normalToWorld[3];
+        T_VEC4 normalToObject[3];
+        T_VEC4 attributes[65];
+    };
+
+    struct ChunkPBRVertex {
+        T_FLOAT posX;
+        T_FLOAT posY;
+        T_FLOAT posZ;
+        T_UINT normalOct;
+
+        T_VEC2 textureUV;
+        T_UINT colorRGBA8;
+        T_UINT lightUV;
+
+        T_UINT textureID;
+        T_UINT packedData;
     };
 
     struct PositionVertex {
@@ -167,8 +201,24 @@ namespace VertexFormat {
         T_UINT pad0;
     };
 #ifdef __cplusplus
-}; // namespace VertexFormat
+};
 
+static_assert(sizeof(VertexFormat::EntityInstanceMaterial) == 48);
+static_assert(sizeof(VertexFormat::EntityGeometryHeader) == 64);
+static_assert(sizeof(VertexFormat::EntityGeometryHeader) == offsetof(VertexFormat::EntityGeometryInstance, rawAddressLo));
+static_assert(sizeof(VertexFormat::EntityGeometryInstance) == 1216);
+static_assert(offsetof(VertexFormat::EntityGeometryInstance, material) == 16);
+static_assert(sizeof(VertexFormat::EntityPBRVertex) == 64);
+static_assert(offsetof(VertexFormat::EntityPBRVertex, normalOct) == 12);
+static_assert(offsetof(VertexFormat::EntityPBRVertex, postBase) == 48);
+static_assert(offsetof(VertexFormat::EntityPBRVertex, packedData) == 60);
+static_assert(sizeof(VertexFormat::ChunkPBRVertex) == 40);
+static_assert(offsetof(VertexFormat::ChunkPBRVertex, normalOct) == 12);
+static_assert(offsetof(VertexFormat::ChunkPBRVertex, textureUV) == 16);
+static_assert(offsetof(VertexFormat::ChunkPBRVertex, colorRGBA8) == 24);
+static_assert(offsetof(VertexFormat::ChunkPBRVertex, lightUV) == 28);
+static_assert(offsetof(VertexFormat::ChunkPBRVertex, textureID) == 32);
+static_assert(offsetof(VertexFormat::ChunkPBRVertex, packedData) == 36);
 static_assert(sizeof(VertexFormat::MaterialVertex) == 80);
 static_assert(offsetof(VertexFormat::MaterialVertex, lightUV) == 64);
 static_assert(offsetof(VertexFormat::MaterialVertex, packedData) == 72);
@@ -187,16 +237,16 @@ namespace Data {
     };
 
     struct DirectionalLight {
-        T_VEC3 direction;  // 12 bytes
-        T_FLOAT pad0;      // 4 bytes
-        T_VEC3 color;      // 12 bytes
-        T_FLOAT intensity; // 4 bytes
+        T_VEC3 direction;
+        T_FLOAT pad0;
+        T_VEC3 color;
+        T_FLOAT intensity;
     };
 
     struct World {
-        DirectionalLight directionalLight; // 32 bytes
-        T_FLOAT time;                      // 4 bytes
-        T_UINT seed;                       // 4 bytes
+        DirectionalLight directionalLight;
+        T_FLOAT time;
+        T_UINT seed;
     };
 
     struct OverlayPostUBO {
@@ -236,17 +286,22 @@ namespace Data {
 
         T_UINT fogType;
         T_UINT skyType;
-        T_UINT pad2;
-        T_UINT pad3;
+        T_INT worldBottomY;
+        T_INT worldTopY;
 
-        T_DVEC4 cameraPos; // w for padding
-        T_IVEC4 chunkGridInfo; // x=sizeX, y=sizeY, z=sizeZ, w=bottomSectionCoord
-        T_IVEC4 chunkStorageSectionPos; // xyz=BuiltChunkStorage.sectionPos
+        T_DVEC4 cameraPos;
+        T_IVEC4 chunkGridInfo;
+        T_IVEC4 chunkStorageSectionPos;
 
         T_UINT endSkyTextureID;
         T_UINT endPortalTextureID;
         T_UINT lightMapTextureID;
-        T_UINT pad4;
+        T_UINT renderDistanceBlocks;
+        T_UINT vistaDistanceBlocks;
+        T_UINT vistaInstanceOffset;
+        T_UINT vistaInstanceCount;
+        T_UINT vistaTextureID;
+        T_IVEC4 vistaCoverage;
     };
 
     struct SkyUBO {
@@ -266,7 +321,7 @@ namespace Data {
 
         T_UINT sunTextureID;
         T_UINT moonTextureID;
-        T_UINT pad0;
+        T_UINT rainData;
     };
 
     struct TextureMapEntry {
@@ -308,10 +363,10 @@ namespace Data {
         T_FLOAT pad0;
     };
 #ifdef __cplusplus
-}; // namespace Data
+};
 #endif
 #ifdef __cplusplus
-}; // namespace vk
+};
 #endif
 
 #endif

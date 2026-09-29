@@ -3,6 +3,9 @@
 
 #define EPS 1e-6
 
+const vec4 LABPBR_DEFAULT_SPECULAR = vec4(0.0);
+const vec4 LABPBR_DEFAULT_NORMAL = vec4(0.5, 0.5, 1.0, 1.0);
+
 struct LabPBRMat {
     vec3 albedo;
     vec3 f0;
@@ -27,7 +30,7 @@ LabPBRMat convertLabPBRMaterial(vec4 texAlbedo, vec4 texSpecular, vec4 texNormal
     LabPBRMat mat;
 
     mat.roughness = pow(1.0 - texSpecular.r, 2.0);
-    // LabPBR: A value of 255 (100%) results in a very smooth material (e.g. polished granite)
+
     mat.roughness = mix(0.01, 1.0, mat.roughness);
 
     float sssOffset = 65.0 / 255.0;
@@ -52,39 +55,39 @@ LabPBRMat convertLabPBRMaterial(vec4 texAlbedo, vec4 texSpecular, vec4 texNormal
         mat.albedo = texAlbedo.rgb;
 
         float specularValue = texSpecular.g;
-        float F0 = max(specularValue, 0.02); // LabPBR clamp
+        float F0 = max(specularValue, 0.02);
         mat.f0 = vec3(F0);
 
         float sqrtF0 = sqrt(F0);
         mat.ior = (1.0 + sqrtF0) / max(1.0 - sqrtF0, EPS);
 
-        if (texAlbedo.a < 1.0 - EPS) { mat.transmission = 1.0; }
+        mat.transmission = clamp(1.0 - texAlbedo.a, 0.0, 1.0);
     } else if (metalIdx <= 237) {
         vec3 n = vec3(1.0);
         vec3 k = vec3(0.0);
 
-        if (metalIdx == 230) { // Iron
+        if (metalIdx == 230) {
             n = vec3(2.9114, 2.9497, 2.5845);
             k = vec3(3.0893, 2.9318, 2.7670);
-        } else if (metalIdx == 231) { // Gold
+        } else if (metalIdx == 231) {
             n = vec3(0.18299, 0.42108, 1.3734);
             k = vec3(3.4242, 2.3459, 1.7704);
-        } else if (metalIdx == 232) { // Aluminium
+        } else if (metalIdx == 232) {
             n = vec3(1.3456, 0.96521, 0.61722);
             k = vec3(7.4746, 6.3995, 5.3031);
-        } else if (metalIdx == 233) { // Chrome
+        } else if (metalIdx == 233) {
             n = vec3(3.1071, 3.1812, 2.3230);
             k = vec3(3.3314, 3.3291, 3.1350);
-        } else if (metalIdx == 234) { // Copper
+        } else if (metalIdx == 234) {
             n = vec3(0.27105, 0.67693, 1.3164);
             k = vec3(3.6092, 2.6248, 2.2921);
-        } else if (metalIdx == 235) { // Lead
+        } else if (metalIdx == 235) {
             n = vec3(1.9100, 1.8300, 1.4400);
             k = vec3(3.5100, 3.4000, 3.1800);
-        } else if (metalIdx == 236) { // Platinum
+        } else if (metalIdx == 236) {
             n = vec3(2.3757, 2.0847, 1.8453);
             k = vec3(4.2655, 3.7153, 3.1365);
-        } else if (metalIdx == 237) { // Silver
+        } else if (metalIdx == 237) {
             n = vec3(0.15943, 0.14512, 0.13547);
             k = vec3(3.9291, 3.1900, 2.3808);
         }
@@ -99,9 +102,9 @@ LabPBRMat convertLabPBRMaterial(vec4 texAlbedo, vec4 texSpecular, vec4 texNormal
     }
 
     mat.normal.xy = texNormal.xy * 2.0 - 1.0;
-    mat.normal.z = sqrt(1.0 - dot(mat.normal.xy, mat.normal.xy));
+    mat.normal.z = sqrt(max(1.0 - dot(mat.normal.xy, mat.normal.xy), 0.0));
 
-    mat.ao = texNormal.x;
+    mat.ao = texNormal.b;
     mat.height = texNormal.w;
 
     return mat;

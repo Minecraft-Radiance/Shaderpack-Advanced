@@ -1,0 +1,76 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/shared.hpp"
+#include "lighting/shadow/payload.glsl"
+
+layout(set = 2, binding = 2) uniform ComposeSkyUniform {
+    SkyUBO skyUBO;
+};
+
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+#    define ADV_DIRECT_RADIANCE_READ 1
+#endif
+#include "output/signals.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 3, binding = 0, rgba16f) writeonly uniform image2D outputRadianceImage;
+layout(set = 3, binding = 9, rgba16f) readonly uniform image2D outputIndirectDiffuseRadianceImage;
+layout(set = 3, binding = 11, rgba16f) readonly uniform image2D outputIndirectSpecularRadianceImage;
+layout(set = 3, binding = 13, rgba16f) readonly uniform image2D composeClearImage;
+layout(set = 3, binding = 15, rgba16f) readonly uniform image2D composeBaseEmissionImage;
+layout(set = 3, binding = 16, rgba16f) readonly uniform image2D composeFogImage;
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+layout(set = 3, binding = 17, rgba16f) writeonly uniform image2D outputDirectDiffuseRadianceImage;
+layout(set = 3, binding = 18, rgba16f) writeonly uniform image2D outputDirectSpecularRadianceImage;
+#endif
+
+const vec3 ADV_COMPOSE_UNDERWATER_SURFACE_COLOR = vec3(0.0, 0.48, 0.65);
+
+bool isComposeFinite(vec4 value) {
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec4 sanitizeComposeSignal(vec4 signal) {
+    if (signal.a <= 0.0 || !isComposeFinite(signal)) { return vec4(0.0); }
+    return vec4(signalSanitizeRadiance(signal.rgb), 1.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 resolution = imageSize(outputRadianceImage);
+    if (any(greaterThanEqual(pixel, resolution))) { return; }
+
+    vec4 diffuse = sanitizeComposeSignal(imageLoad(outputIndirectDiffuseRadianceImage, pixel));
+    vec4 specular = sanitizeComposeSignal(imageLoad(outputIndirectSpecularRadianceImage, pixel));
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+    RawRadiance directCenter = loadDirectRawRadiance(pixel);
+    vec4 directDiffuse = sanitizeComposeSignal(directCenter.diffuse);
+    vec4 directSpecular = sanitizeComposeSignal(directCenter.specular);
+    imageStore(outputDirectDiffuseRadianceImage, pixel, directDiffuse);
+    imageStore(outputDirectSpecularRadianceImage, pixel, directSpecular);
+#endif
+    vec4 clear = imageLoad(composeClearImage, pixel);
+    vec4 emission = imageLoad(composeBaseEmissionImage, pixel);
+    vec3 baseRadiance;
+    if (clear.a > 0.0 && isComposeFinite(clear)) {
+        baseRadiance = signalSanitizeRadiance(clear.rgb);
+    } else {
+        baseRadiance = signalSanitizeRadiance(
+            (diffuse.a > 0.0 ? diffuse.rgb : vec3(0.0)) + (specular.a > 0.0 ? specular.rgb : vec3(0.0))
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+            + (directDiffuse.a > 0.0 ? directDiffuse.rgb : vec3(0.0)) +
+            (directSpecular.a > 0.0 ? directSpecular.rgb : vec3(0.0))
+#endif
+            + (emission.a > 0.0 && isComposeFinite(emission) ? emission.rgb : vec3(0.0)));
+        if (skyUBO.cameraSubmersionType == 1u) {
+            baseRadiance = signalSanitizeRadiance(baseRadiance * ADV_COMPOSE_UNDERWATER_SURFACE_COLOR);
+        }
+    }
+
+    vec4 fog = imageLoad(composeFogImage, pixel);
+    vec3 radiance =
+        fog.a >= 0.0 && isComposeFinite(fog) ? signalFoggedRadiance(baseRadiance, fog.rgb, fog.a) : baseRadiance;
+    imageStore(outputRadianceImage, pixel, vec4(radiance, 1.0));
+}

@@ -1,0 +1,88 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "scene/resources.glsl"
+#include "core/checkerboard.glsl"
+#include "path/state.glsl"
+#include "path/indirect/lobes.glsl"
+#define ADV_INDIRECT_QUEUE_WRITE 1
+#include "path/indirect/queue.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+shared uint localDiffuseCount;
+shared uint localSpecularCount;
+shared uint globalDiffuseBase;
+shared uint globalSpecularBase;
+shared uint localDiffusePixels[128];
+shared uint localSpecularPixels[128];
+
+void classifyPixel(ivec2 pixel, ivec2 extent) {
+    if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, extent))) { return; }
+
+    CheckerCoordinate checker = flatToChecker(pixel, extent);
+    LobeSurface surface = loadLobeSurface(checker.packedPixel);
+    if (!isLobeSurfaceShadeable(surface.key) || !hasPathRayBudget(pathRayBudgetUsed(surface.key))) { return; }
+
+    uint linearPixel = uint(pixel.y) * uint(ADV_RENDER_WIDTH) + uint(pixel.x);
+    if (!indirectUsesHalfRate() && indirectUsesFullRateLobes(surface.key)) {
+        uint diffuseIndex = atomicAdd(localDiffuseCount, 1u);
+        uint specularIndex = atomicAdd(localSpecularCount, 1u);
+        if (diffuseIndex < 128u) { localDiffusePixels[diffuseIndex] = linearPixel; }
+        if (specularIndex < 128u) { localSpecularPixels[specularIndex] = linearPixel; }
+        return;
+    }
+
+    bool specular = selectedLobe(pixel, surface) == 1u;
+    if (specular) {
+        uint index = atomicAdd(localSpecularCount, 1u);
+        if (index < 128u) { localSpecularPixels[index] = linearPixel; }
+    } else {
+        uint index = atomicAdd(localDiffuseCount, 1u);
+        if (index < 128u) { localDiffusePixels[index] = linearPixel; }
+    }
+}
+
+void main() {
+    ivec2 pairIndex = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = ivec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    uint localIndex = gl_LocalInvocationIndex;
+    if (localIndex == 0u) {
+        localDiffuseCount = 0u;
+        localSpecularCount = 0u;
+    }
+    barrier();
+
+    bool isInBounds = pairIndex.x < (extent.x + 1) / 2 && pairIndex.y < extent.y;
+    if (isInBounds) {
+        ivec2 pairOrigin = ivec2(pairIndex.x * 2, pairIndex.y);
+        if (indirectUsesHalfRate()) {
+            classifyPixel(indirectPairRepresentative(pairOrigin, extent), extent);
+        } else {
+            classifyPixel(pairOrigin, extent);
+            classifyPixel(pairOrigin + ivec2(1, 0), extent);
+        }
+    }
+    barrier();
+
+    if (localIndex == 0u) {
+        globalDiffuseBase = reserveIndirectRays(false, localDiffuseCount);
+        globalSpecularBase = reserveIndirectRays(true, localSpecularCount);
+    }
+    barrier();
+
+    uint width = uint(ADV_RENDER_WIDTH);
+    for (uint index = localIndex; index < localDiffuseCount; index += 64u) {
+        uint linearPixel = localDiffusePixels[index];
+        storeIndirectRay(ivec2(int(linearPixel % width), int(linearPixel / width)), false, globalDiffuseBase + index);
+    }
+    for (uint index = localIndex; index < localSpecularCount; index += 64u) {
+        uint linearPixel = localSpecularPixels[index];
+        storeIndirectRay(ivec2(int(linearPixel % width), int(linearPixel / width)), true, globalSpecularBase + index);
+    }
+}

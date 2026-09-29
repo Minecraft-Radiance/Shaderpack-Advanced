@@ -1,0 +1,259 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#ifndef ADV_VOLUME_DIRECT_HISTORY_READY
+#    define ADV_VOLUME_DIRECT_HISTORY_READY false
+#endif
+#ifndef ADV_VOLUME_DIRECT_PING_INPUT
+#    define ADV_VOLUME_DIRECT_PING_INPUT true
+#endif
+#define ADV_VOLUME_HISTORY_READY ADV_VOLUME_DIRECT_HISTORY_READY
+
+#include "scene/resources.glsl"
+#include "lighting/bsdf.glsl"
+#include "lighting/shadow/payload.glsl"
+#include "environment/celestial.glsl"
+#include "volume/froxel.glsl"
+#include "util/sampling_helpers.glsl"
+
+layout(set = 5, binding = ADV_SKY_RADIANCE_BINDING) uniform samplerCube skyRadianceTexture;
+#include "environment/sky.glsl"
+vec2 volumeCloudJitterCoordinate;
+#define ADV_CLOUD_JITTER_COORD volumeCloudJitterCoordinate
+#include "environment/cloud/shade.glsl"
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(location = 0) rayPayloadEXT ShadowPayload volumeShadowPayload;
+
+layout(set = 5,
+       binding = ADV_PRIMARY_HIT_BARY_DEPTH_BINDING,
+       rg32ui) readonly uniform uimage2D primaryHitBaryDepthImage;
+layout(set = 5, binding = ADV_PATH_METADATA_BINDING, rg32ui) readonly uniform uimage2D pathMetadataImage;
+layout(set = 5, binding = ADV_BLUE_NOISE_BINDING) uniform sampler2D blueNoiseTexture;
+layout(set = 5, binding = ADV_VOLUME_DIRECT_A_SAMPLED_BINDING) uniform sampler3D volumeDirectATexture;
+layout(set = 5, binding = ADV_VOLUME_DIRECT_A_STORAGE_BINDING, rgba16f) writeonly uniform image3D volumeDirectAImage;
+layout(set = 5, binding = ADV_VOLUME_DIRECT_B_SAMPLED_BINDING) uniform sampler3D volumeDirectBTexture;
+layout(set = 5, binding = ADV_VOLUME_DIRECT_B_STORAGE_BINDING, rgba16f) writeonly uniform image3D volumeDirectBImage;
+layout(set = 5, binding = ADV_VOLUME_FAR_HISTORY_A_SAMPLED_BINDING) uniform sampler2D volumeFarHistoryATexture;
+layout(set = 5, binding = ADV_VOLUME_FAR_HISTORY_B_SAMPLED_BINDING) uniform sampler2D volumeFarHistoryBTexture;
+layout(set = 5,
+       binding = ADV_VOLUME_FAR_HISTORY_A_STORAGE_BINDING,
+       rgba16f) writeonly uniform image2D volumeFarHistoryAImage;
+layout(set = 5,
+       binding = ADV_VOLUME_FAR_HISTORY_B_STORAGE_BINDING,
+       rgba16f) writeonly uniform image2D volumeFarHistoryBImage;
+
+#ifndef ADV_RAY_FLAGS
+#    define ADV_RAY_FLAGS 0x200u
+#endif
+#ifndef ADV_VOLUME_SHADOW_MISS_INDEX
+#    define ADV_VOLUME_SHADOW_MISS_INDEX 0
+#endif
+#ifndef ADV_VOLUME_SHADOW_MAX_DISTANCE
+#    define ADV_VOLUME_SHADOW_MAX_DISTANCE 1000.0
+#endif
+
+#define ADV_SUN_SHADOW_PAYLOAD volumeShadowPayload
+#define ADV_SUN_SHADOW_PAYLOAD_LOCATION 0
+#include "lighting/shadow/trace.glsl"
+
+vec4 loadDirectVolumeHistory(vec3 scenePosition, out bool isHistoryValid) {
+    vec3 previousUvw;
+    isHistoryValid = volumeReproject(scenePosition, ADV_VOLUME_DIRECT_EXTENT, previousUvw);
+    if (!isHistoryValid) { return vec4(0.0); }
+    vec4 history = ADV_VOLUME_DIRECT_PING_INPUT ? textureLod(volumeDirectATexture, previousUvw, 0.0) :
+                                                  textureLod(volumeDirectBTexture, previousUvw, 0.0);
+    isHistoryValid = isVolumeFinite(history.rgb) && isVolumeFinite(history.w);
+    return isHistoryValid ? history : vec4(0.0);
+}
+
+void storeDirectVolume(ivec3 coordinate, vec4 volumeSample) {
+    if (ADV_VOLUME_DIRECT_PING_INPUT) {
+        imageStore(volumeDirectBImage, coordinate, volumeSample);
+    } else {
+        imageStore(volumeDirectAImage, coordinate, volumeSample);
+    }
+}
+
+float directVolumeLuminance(vec3 radiance) {
+    return dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void shadeDirectFroxel(ivec3 coordinate, bool shouldTrace) {
+    volumeCloudJitterCoordinate = vec2(coordinate.xy);
+    bool isUnderwater = isCameraUnderwater(skyUBO.cameraSubmersionType);
+    vec2 centerUv = volumeUvFromFroxel(coordinate.xy, ADV_VOLUME_DIRECT_EXTENT.xy);
+    vec3 centerDirection = volumeRayDirection(centerUv);
+    float centerDistance = volumeDistanceFromW(volumeSliceCenterW(coordinate.z, ADV_VOLUME_DIRECT_EXTENT.z));
+    vec3 centerPosition = volumeCameraOrigin() + centerDirection * centerDistance;
+
+    bool isHistoryValid;
+    vec4 history = loadDirectVolumeHistory(centerPosition, isHistoryValid);
+    if (canCarryVolumeHistory(history, isHistoryValid, isUnderwater) && !shouldTrace) {
+        storeDirectVolume(coordinate, history);
+        return;
+    }
+
+    vec2 randomSample = blueNoise2(blueNoiseTexture, coordinate.xy, worldUBO.seed ^ uint(coordinate.z * 0x9e37), 0u);
+    vec2 jitteredUv = centerUv + (randomSample - 0.5) / vec2(ADV_VOLUME_DIRECT_EXTENT.xy);
+    jitteredUv =
+        clamp(jitteredUv, 0.5 / vec2(ADV_VOLUME_DIRECT_EXTENT.xy), vec2(1.0) - 0.5 / vec2(ADV_VOLUME_DIRECT_EXTENT.xy));
+    ivec2 flatPixel = volumeFlatPixel(jitteredUv);
+    vec2 quantizedUv =
+        (vec2(flatPixel) + 0.5 + worldUBO.cameraJitter) / vec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    vec3 rayDirection = volumeRayDirection(quantizedUv);
+
+    float centerW = volumeSliceCenterW(coordinate.z, ADV_VOLUME_DIRECT_EXTENT.z);
+    float jitteredW = centerW + (randomSample.x - 0.5) / float(ADV_VOLUME_DIRECT_EXTENT.z);
+    float sampleDistance = volumeDistanceFromW(jitteredW);
+    ivec2 packedDepthPixel = volumePackedPixel(jitteredUv);
+    float primaryViewDepth = all(greaterThanEqual(packedDepthPixel, ivec2(0))) ?
+                                 uintBitsToFloat(imageLoad(primaryHitBaryDepthImage, packedDepthPixel).y) :
+                                 65504.0;
+    float primaryDistance = volumePrimaryRayDistance(primaryViewDepth, rayDirection);
+    uint pathFlags =
+        all(greaterThanEqual(packedDepthPixel, ivec2(0))) ? imageLoad(pathMetadataImage, packedDepthPixel).x : 0u;
+    if (!volumeAllowsTransparentIndirect(pathFlags)) {
+        sampleDistance = min(sampleDistance, max(primaryDistance * 0.99 - 0.01, 0.0));
+    }
+    float froxelFrontDistance = volumeDistanceFromW(volumeSliceFrontW(coordinate.z, ADV_VOLUME_DIRECT_EXTENT.z));
+    if (sampleDistance < froxelFrontDistance) {
+        storeDirectVolume(coordinate, volumeDecayOccludedHistory(history, isHistoryValid, isUnderwater));
+        return;
+    }
+
+    vec3 position = volumeCameraOrigin() + rayDirection * sampleDistance;
+    vec3 lightDirection;
+    vec3 lightRadiance;
+    float lightScale;
+    getCelestialPrimaryDirectLight(lightDirection, lightRadiance, lightScale);
+    float rain = smoothstep(0.0, 1.0, skyUBO.rainGradient);
+    if (!isUnderwater) { lightRadiance *= mix(1.0, 0.25, rain) / mix(1.0, 0.05, rain); }
+    vec3 inscatter = vec3(0.0);
+    if (worldUBO.skyType == 1u && lightScale > 1e-6) {
+        uint traceMask = WORLD_MASK | CLOUD_MASK | BOAT_WATER_MASK;
+        if (worldUBO.isFirstPerson == 0u) { traceMask |= PLAYER_MASK; }
+        vec3 underwaterDirection = lightDirection;
+        if (isUnderwater) { underwaterDirection = underwaterDirectionToLight(lightDirection); }
+        vec3 traceDirection = isUnderwater ? underwaterDirection : lightDirection;
+        SunShadowTrace shadow = traceSunShadow(position + traceDirection * 0.001, lightDirection, underwaterDirection,
+                                               isUnderwater, float(ADV_VOLUME_SHADOW_MAX_DISTANCE), 0u, traceMask,
+                                               uint(ADV_RAY_FLAGS), uint(ADV_VOLUME_SHADOW_MISS_INDEX));
+        vec3 transmission = shadow.reachedLight != 0u ? shadow.transmission : vec3(0.0);
+        transmission *= cloudLightVisibility(position + vec3(worldUBO.cameraPos.xyz), lightDirection,
+                                             max(ADV_CLOUD_LIGHT_STEPS, 1), 0.175);
+        float anisotropy = isUnderwater ? ADV_VOLUME_WATER_ANISOTROPY : ADV_VOLUME_AIR_ANISOTROPY;
+        float cosine = clamp(dot(lightDirection, rayDirection), -1.0, 1.0);
+        float miePhase = volumeHenyeyGreenstein(anisotropy, cosine) * (0.25 / ADV_VOLUME_PI);
+        vec3 phase = vec3(miePhase);
+        if (!isUnderwater) {
+            vec3 extinction = volumeExtinction(false);
+            vec3 rayleigh = ADV_ATMOSPHERE_BETA_R * 18.0;
+            float rayleighPhase = 3.0 * (1.0 + cosine * cosine) / (16.0 * ADV_VOLUME_PI);
+            phase = (volumeAirMieExtinction(0.0) * (miePhase * 8.0) + rayleigh * rayleighPhase) / extinction;
+        }
+        inscatter = phase * lightRadiance * transmission;
+    }
+
+    storeDirectVolume(coordinate, volumeTemporalBlend(inscatter, history, isHistoryValid, isUnderwater,
+                                                      ADV_VOLUME_DIRECT_MAX_HISTORY));
+}
+
+void shadeFarVolumeVisibility(ivec2 coordinate) {
+    vec2 uv = volumeUvFromFroxel(coordinate, ADV_VOLUME_DIRECT_EXTENT.xy);
+    ivec2 flatPixel = volumeFlatPixel(uv);
+    vec2 quantizedUv =
+        (vec2(flatPixel) + 0.5 + worldUBO.cameraJitter) / vec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    vec3 rayDirection = volumeRayDirection(quantizedUv);
+    ivec2 packedPixel = volumePackedPixel(uv);
+    float viewDepth = all(greaterThanEqual(packedPixel, ivec2(0))) ?
+                          uintBitsToFloat(imageLoad(primaryHitBaryDepthImage, packedPixel).y) : 65504.0;
+    float distance = volumePrimaryRayDistance(viewDepth, rayDirection);
+    vec3 visibility = vec3(1.0);
+    bool hasFarShadows = distance > ADV_VOLUME_RANGE && worldUBO.skyType == 1u &&
+                         !isCameraUnderwater(skyUBO.cameraSubmersionType) && skyUBO.rainGradient < 1.0;
+    if (hasFarShadows) {
+        vec3 sunDirection = getCelestialSunDirection();
+        float sunLuminance = directVolumeLuminance(max(textureLod(skyRadianceTexture, sunDirection, 0.0).rgb, vec3(0.0)));
+        float moonLuminance =
+            directVolumeLuminance(max(textureLod(skyRadianceTexture, -sunDirection, 0.0).rgb, vec3(0.0)));
+        vec3 lightDirection = sunLuminance >= moonLuminance ? sunDirection : -sunDirection;
+        uint traceMask = WORLD_MASK | CLOUD_MASK;
+        if (worldUBO.isFirstPerson == 0u) { traceMask |= PLAYER_MASK; }
+        vec3 weightedVisibility = vec3(0.0);
+        vec3 totalWeight = vec3(0.0);
+        vec3 transmittance = vec3(1.0);
+        vec3 extinction = volumeExtinction(false);
+        float stepLength = (distance - ADV_VOLUME_RANGE) * 0.25;
+        vec2 randomSample = blueNoise2(blueNoiseTexture, coordinate, worldUBO.seed, 3u);
+        float weightedDistance = 0.0;
+        for (int sampleIndex = 0; sampleIndex < 4; ++sampleIndex) {
+            float offset = fract(randomSample.x + float(sampleIndex) * 0.618033989);
+            float sampleDistance = ADV_VOLUME_RANGE + (float(sampleIndex) + offset) * stepLength;
+            vec3 position = volumeCameraOrigin() + rayDirection * sampleDistance;
+            float midpointDistance = ADV_VOLUME_RANGE + (float(sampleIndex) + 0.5) * stepLength;
+            float height = max(volumeCameraOrigin().y + rayDirection.y * midpointDistance +
+                                   float(worldUBO.cameraPos.y) - 64.0, 0.0);
+            vec3 stepTransmittance = exp(-extinction * exp(-height * 0.012) * stepLength * 1.6);
+            vec3 weight = transmittance * (vec3(1.0) - stepTransmittance);
+            SunShadowTrace shadow = traceSunShadow(position + lightDirection * 0.001, lightDirection, lightDirection,
+                                                   false, float(ADV_VOLUME_SHADOW_MAX_DISTANCE), 0u, traceMask,
+                                                   uint(ADV_RAY_FLAGS), uint(ADV_VOLUME_SHADOW_MISS_INDEX));
+            weightedVisibility += weight * (shadow.reachedLight != 0u ? shadow.transmission : vec3(0.0));
+            weightedDistance += directVolumeLuminance(weight) * midpointDistance;
+            totalWeight += weight;
+            transmittance *= stepTransmittance;
+        }
+        visibility = clamp(weightedVisibility / max(totalWeight, vec3(1e-6)), vec3(0.0), vec3(1.0));
+        float historyDistance = weightedDistance / max(directVolumeLuminance(totalWeight), 1e-6);
+        vec3 previousUvw;
+        if (volumeReproject(volumeCameraOrigin() + rayDirection * historyDistance,
+                            ADV_VOLUME_DIRECT_EXTENT, previousUvw)) {
+            vec4 history = ADV_VOLUME_DIRECT_PING_INPUT ? textureLod(volumeFarHistoryATexture, previousUvw.xy, 0.0) :
+                                                         textureLod(volumeFarHistoryBTexture, previousUvw.xy, 0.0);
+            vec3 cameraDelta = vec3(worldUBO.cameraPos.xyz - lastWorldUBO.cameraPos.xyz) +
+                               volumeCameraOrigin() - lastWorldUBO.cameraEffectedViewMatInv[3].xyz;
+            float previousDistance = length(rayDirection * distance + cameraDelta);
+            float depthTolerance = max(distance * 0.05, 1.0);
+            if (isVolumeFinite(history.rgb) && isVolumeFinite(history.a) && history.a > ADV_VOLUME_RANGE &&
+                abs(history.a - previousDistance) < depthTolerance &&
+                abs(worldUBO.gameTime - lastWorldUBO.gameTime) < 0.001) {
+                float historyWeight = 0.9375 * exp(-length(cameraDelta) * 0.5);
+                visibility = mix(visibility, clamp(history.rgb, vec3(0.0), vec3(1.0)), historyWeight);
+            }
+        }
+    }
+    vec4 result = vec4(visibility, hasFarShadows ? distance : -distance);
+    if (ADV_VOLUME_DIRECT_PING_INPUT) {
+        imageStore(volumeFarHistoryBImage, coordinate, result);
+    } else {
+        imageStore(volumeFarHistoryAImage, coordinate, result);
+    }
+}
+
+void main() {
+    ivec3 dispatchCoordinate = ivec3(gl_LaunchIDEXT.xyz);
+#if ADV_FROXEL_RESOLUTION_MODE == 1
+    if (any(greaterThanEqual(dispatchCoordinate, ADV_VOLUME_DIRECT_EXTENT))) { return; }
+    shadeDirectFroxel(dispatchCoordinate, true);
+    if (dispatchCoordinate.z == 0) { shadeFarVolumeVisibility(dispatchCoordinate.xy); }
+#else
+    ivec3 dispatchExtent = volumeCheckerboardDispatchExtent(ADV_VOLUME_DIRECT_EXTENT);
+    if (any(greaterThanEqual(dispatchCoordinate, dispatchExtent))) { return; }
+
+    uint phase = uint(ADV_VOLUME_DIRECT_PHASE);
+    ivec3 activeCoordinate = volumeCheckerboardCoordinate(dispatchCoordinate, phase);
+    shadeDirectFroxel(activeCoordinate, true);
+
+    ivec3 inactiveCoordinate = volumeCheckerboardCoordinate(dispatchCoordinate, phase ^ 1u);
+    if (inactiveCoordinate.x < ADV_VOLUME_DIRECT_EXTENT.x) { shadeDirectFroxel(inactiveCoordinate, false); }
+    if (dispatchCoordinate.z == 0) {
+        shadeFarVolumeVisibility(activeCoordinate.xy);
+        if (inactiveCoordinate.x < ADV_VOLUME_DIRECT_EXTENT.x) { shadeFarVolumeVisibility(inactiveCoordinate.xy); }
+    }
+#endif
+}

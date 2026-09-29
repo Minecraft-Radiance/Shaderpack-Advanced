@@ -1,0 +1,100 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "scene/resources.glsl"
+#include "core/checkerboard.glsl"
+#define ADV_PRIMARY_HIT_WRITE
+#include "path/primary/hit_buffer.glsl"
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(location = 0) rayPayloadEXT HitPayload hitPayload;
+
+#include "path/primary/trace.glsl"
+
+bool discoveryProjectPreviousPosition(vec3 previousPosition,
+                                      vec2 currentPixelCenter,
+                                      vec2 resolution,
+                                      out vec2 motion) {
+    motion = vec2(0.0);
+    vec4 previousView = lastWorldUBO.cameraEffectedViewMat * vec4(previousPosition, 1.0);
+    if (any(isnan(previousView)) || any(isinf(previousView)) || previousView.z >= -1e-6) { return false; }
+    vec4 previousClip = lastWorldUBO.cameraProjMat * previousView;
+    if (any(isnan(previousClip)) || any(isinf(previousClip)) || previousClip.w <= 1e-8) { return false; }
+    vec2 previousNdc = previousClip.xy / previousClip.w;
+    vec2 previousPixel = (previousNdc * 0.5 + 0.5) * resolution;
+    motion = previousPixel - currentPixelCenter;
+    return !any(isnan(motion)) && !any(isinf(motion));
+}
+
+bool buildDiscoveryTemporal(HitPayload hit,
+                            vec3 rayOrigin,
+                            vec3 rayDirection,
+                            ivec2 flatPixel,
+                            ivec2 flatExtent,
+                            out float depth,
+                            out vec2 motion) {
+    depth = ADV_PRIMARY_TEMPORAL_INVALID_DEPTH;
+    motion = vec2(0.0);
+    if (!isHitValid(hit)) { return false; }
+
+    vec3 position = rayOrigin + rayDirection * hit.hitT;
+    if (any(isnan(position)) || any(isinf(position))) { return false; }
+    depth = -(worldUBO.cameraEffectedViewMat * vec4(position, 1.0)).z;
+    if (isnan(depth) || isinf(depth) || depth < 0.0) { return false; }
+
+    vec3 previousPosition = position + vec3(worldUBO.cameraPos.xyz - lastWorldUBO.cameraPos.xyz);
+    if (isChunkGeometryBufferIndex(hit.geometryBufferIndex)) { return true; }
+    if (!isChunkGeometryBufferIndex(hit.geometryBufferIndex)) {
+        vec2 normalizedBarycentrics;
+        if (!normalizePrimaryHitBarycentrics(hit.barycentrics, normalizedBarycentrics)) { return false; }
+        vec3 bary = vec3(1.0 - normalizedBarycentrics.x - normalizedBarycentrics.y, normalizedBarycentrics);
+        uint i0, i1, i2;
+        loadTriangleIndices(hit.geometryBufferIndex, hit.primitiveId, i0, i1, i2);
+        PositionVertex p0 = loadPositionVertex(hit.geometryBufferIndex, i0);
+        PositionVertex p1 = loadPositionVertex(hit.geometryBufferIndex, i1);
+        PositionVertex p2 = loadPositionVertex(hit.geometryBufferIndex, i2);
+        vec3 localPosition = bary.x * p0.pos + bary.y * p1.pos + bary.z * p2.pos;
+        if (!loadPreviousGeometryWorldPosition(hit.geometryBufferIndex, hit.primitiveId, hit.instanceIndex, bary,
+                                               localPosition, previousPosition)) {
+            previousPosition = position + vec3(worldUBO.cameraPos.xyz - lastWorldUBO.cameraPos.xyz);
+        }
+    }
+    vec2 pixelCenter = vec2(flatPixel) + 0.5 + worldUBO.cameraJitter;
+    if (!discoveryProjectPreviousPosition(previousPosition, pixelCenter, vec2(flatExtent), motion)) {
+        motion = vec2(0.0);
+    }
+    return true;
+}
+
+void main() {
+    ivec2 packedPixel = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 flatExtent = ivec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    if (!isPackedCoordinateInBounds(packedPixel, flatExtent)) { return; }
+
+    CheckerCoordinate checker = checkerToFlat(packedPixel, flatExtent);
+    HitPayload hit;
+    resetHit(hit, 0.0, 0.0, ADV_TRACE_ROLE_PRIMARY);
+    if (!checker.isValid) {
+        storePrimaryHit(packedPixel, hit, ADV_PRIMARY_TEMPORAL_INVALID_DEPTH, vec2(0.0), 0u);
+        return;
+    }
+
+    vec3 cameraOrigin;
+    vec3 cameraDirection;
+    float coneSpread;
+    buildPrimaryCameraRay(checker.flatPixel, flatExtent, cameraOrigin, cameraDirection, coneSpread);
+    uint cameraMedium = isCameraUnderwater(skyUBO.cameraSubmersionType) ? ADV_MEDIUM_WATER : ADV_MEDIUM_AIR;
+    uint rayBudgetUsed = 0u;
+    hit = findSegmentHitWithTraceLimit(cameraOrigin, cameraDirection, 0.0, coneSpread, cameraMedium, true, false,
+                                       ADV_PATH_RAY_BUDGET, rayBudgetUsed);
+
+    float temporalDepth;
+    vec2 temporalMotion;
+    buildDiscoveryTemporal(hit, cameraOrigin, cameraDirection, checker.flatPixel, flatExtent, temporalDepth,
+                           temporalMotion);
+    storePrimaryHit(packedPixel, hit, temporalDepth, temporalMotion, rayBudgetUsed);
+}

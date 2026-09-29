@@ -1,0 +1,136 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#include "scene/resources.glsl"
+#include "lighting/restir/resampling.glsl"
+
+uint restirInitialSampleCount(bool hasPrevious, RestirReservoir previous) {
+    uint stableSamples = max(uint(ADV_RESTIR_INITIAL_SAMPLES), 1u);
+    uint boostSamples = max(max(uint(ADV_RESTIR_INITIAL_DISOCCLUSION_SAMPLES), 1u), stableSamples);
+    if (!hasPrevious || !previous.isValid) { return boostSamples; }
+
+    float confidenceCap = restirConfidenceCap();
+    if (previous.confidence <= ADV_RESTIR_LOW_CONFIDENCE_THRESHOLD) { return boostSamples; }
+    if (previous.confidence >= max(8.0, confidenceCap * ADV_RESTIR_STABLE_CONFIDENCE_RATIO)) { return stableSamples; }
+    return max(stableSamples, min(boostSamples, stableSamples * 2u));
+}
+
+void updateRestirInitialTemporal(ivec2 pixel, ivec2 resolution) {
+    bool isCurrentPing = bool(ADV_RESTIR_FRAME_PING_INPUT);
+    RestirTarget target;
+    if (!loadRestirTarget(pixel, resolution, target)) {
+        clearRestirSurfaceKey(pixel, isCurrentPing);
+        storeTemporalRestirReservoir(pixel, isCurrentPing, emptyRestirReservoir());
+        return;
+    }
+
+    vec3 worldPosition = target.position + vec3(worldUBO.cameraPos.xyz);
+    storeRestirSurfaceKey(pixel, isCurrentPing, worldPosition, target.geometryNormal);
+
+    RestirReservoir previous = emptyRestirReservoir();
+    bool hasPrevious = false;
+    if (bool(ADV_RESTIR_HISTORY_READY)) {
+        ivec2 previousPixel;
+        float motionLength;
+        hasPrevious = projectRestirPreviousPixel(pixel, resolution, worldPosition, previousPixel, motionLength) &&
+                      doesRestirHistoryMatch(previousPixel, resolution, worldPosition, target.geometryNormal,
+                                             motionLength, previous);
+        if (hasPrevious) {
+            RestirSurfaceKey previousSurface = loadRestirSurfaceKey(previousPixel, !isCurrentPing);
+            hasPrevious = isRestirReuseStable(target, previous, previousSurface.worldPosition);
+        }
+    }
+
+    uint initialSampleCount = restirInitialSampleCount(hasPrevious, previous);
+    RestirReservoir current =
+        generateInitialRestirReservoir(target, pixel, worldUBO.seed ^ 0x4f1bbcdcu, initialSampleCount);
+    float currentTarget = current.targetFunction;
+    float previousTarget =
+        hasPrevious ? evaluateRestirTarget(target, previous.radiance, previous.point, previous.normal) : 0.0;
+
+    float confidenceCap = restirConfidenceCap();
+    bool hasDynamicSource = (currentTarget > 1e-8 && isRestirEntitySource(current)) ||
+                            (previousTarget > 1e-8 && isRestirEntitySource(previous));
+    float historyCarryCap =
+        hasDynamicSource ? min(confidenceCap, ADV_RESTIR_DYNAMIC_PREVIOUS_CARRY_MAX) : confidenceCap;
+    float currentCount = currentTarget > 1e-8 ? current.confidence : 0.0;
+    float previousCount = previousTarget > 1e-8 ? min(previous.confidence, historyCarryCap) : 0.0;
+    float sampleCount = currentCount + previousCount;
+    if (sampleCount > confidenceCap) {
+        float scale = confidenceCap / sampleCount;
+        currentCount *= scale;
+        previousCount *= scale;
+        sampleCount = confidenceCap;
+    }
+    if (sampleCount <= 1e-8) {
+        RestirReservoir emptyReservoir = emptyRestirReservoir();
+        storeTemporalRestirReservoir(pixel, isCurrentPing, emptyReservoir);
+        return;
+    }
+
+    uint mergeSeed = xxhash32(uvec3(uint(pixel.x), uint(pixel.y), worldUBO.seed ^ 0x19a5e2c7u));
+    RestirReservoirMerge merge = makeRestirReservoirMerge();
+    mergeRestirReservoir(merge, current, currentTarget, currentCount, mergeSeed);
+    mergeRestirReservoir(merge, previous, previousTarget, previousCount, mergeSeed);
+    RestirReservoir temporal = finishRestirReservoirMerge(merge, sampleCount, sampleCount);
+    storeTemporalRestirReservoir(pixel, isCurrentPing, temporal);
+}
+
+void carryRestirInactivePixel(ivec2 pixel, ivec2 resolution) {
+    bool isCurrentPing = bool(ADV_RESTIR_FRAME_PING_INPUT);
+    RestirTarget target;
+    if (!loadRestirTarget(pixel, resolution, target)) {
+        clearRestirSurfaceKey(pixel, isCurrentPing);
+        storeTemporalRestirReservoir(pixel, isCurrentPing, emptyRestirReservoir());
+        return;
+    }
+
+    vec3 worldPosition = target.position + vec3(worldUBO.cameraPos.xyz);
+    storeRestirSurfaceKey(pixel, isCurrentPing, worldPosition, target.geometryNormal);
+    ivec2 previousPixel;
+    float motionLength;
+    bool hasPrevious =
+        projectRestirPreviousPixel(pixel, resolution, worldPosition, previousPixel, motionLength) &&
+        doesRestirHistorySurfaceMatch(previousPixel, resolution, worldPosition, target.geometryNormal, motionLength);
+    if (!hasPrevious) {
+        storeTemporalRestirReservoir(pixel, isCurrentPing, emptyRestirReservoir());
+        return;
+    }
+    RestirReservoir previous = loadTemporalRestirReservoir(previousPixel, !isCurrentPing);
+    RestirSurfaceKey previousSurface = loadRestirSurfaceKey(previousPixel, !isCurrentPing);
+    if (!isRestirReuseStable(target, previous, previousSurface.worldPosition)) {
+        storeTemporalRestirReservoir(pixel, isCurrentPing, emptyRestirReservoir());
+        return;
+    }
+    previous.targetFunction = evaluateRestirTarget(target, previous.radiance, previous.point, previous.normal);
+    ageRestirReservoir(previous);
+    storeTemporalRestirReservoir(pixel, isCurrentPing, previous);
+}
+
+void main() {
+    ivec2 resolution = ivec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    ivec2 dispatchPixel = ivec2(gl_GlobalInvocationID.xy);
+#if ADV_RESTIR_RESOLUTION_MODE == 1
+    if (any(greaterThanEqual(dispatchPixel, resolution))) { return; }
+    updateRestirInitialTemporal(dispatchPixel, resolution);
+#else
+    ivec2 dispatchExtent = restirCheckerboardDispatchExtent(resolution);
+    if (any(greaterThanEqual(dispatchPixel, dispatchExtent))) { return; }
+
+    ivec2 activePixel = restirActivePixel(dispatchPixel);
+    if (activePixel.x < resolution.x) { updateRestirInitialTemporal(activePixel, resolution); }
+
+    ivec2 inactivePixel = restirInactivePixel(dispatchPixel);
+    if (inactivePixel.x >= resolution.x) { return; }
+    if (!bool(ADV_RESTIR_HISTORY_READY)) {
+        updateRestirInitialTemporal(inactivePixel, resolution);
+        return;
+    }
+    carryRestirInactivePixel(inactivePixel, resolution);
+#endif
+}

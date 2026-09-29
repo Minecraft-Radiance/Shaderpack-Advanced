@@ -1,0 +1,84 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define ADV_SCENE_RESOURCES_NO_PREVIOUS_GEOMETRY
+#define ADV_RESTIR_PRECOMPUTE_NEIGHBORHOODS
+#include "scene/resources.glsl"
+#include "lighting/emitters.glsl"
+
+void clearLightNeighborhood(uint chunkIndex) {
+    chunkLightNeighborhoods[chunkIndex].packedHeader = uvec4(0u);
+}
+
+void main() {
+    uint chunkCount = uint(max(worldUBO.chunkGridInfo.x * worldUBO.chunkGridInfo.y * worldUBO.chunkGridInfo.z, 0));
+    uint chunkIndex = gl_GlobalInvocationID.x;
+    if (chunkIndex >= chunkCount) { return; }
+
+    ChunkLights center = chunkLights[chunkIndex];
+    ivec3 centerOrigin = ivec3(center.chunkOriginX, center.chunkOriginY, center.chunkOriginZ);
+    ivec3 centerSection = centerOrigin / 16;
+    if ((center.geometryCount == 0u && !hasChunkLights(center)) ||
+        any(notEqual(lightSectionOrigin(centerSection), centerOrigin)) ||
+        !isRestirSectionWithinPlayerRange(centerSection, worldUBO)) {
+        clearLightNeighborhood(chunkIndex);
+        return;
+    }
+
+    int resolvedIndex;
+    ivec3 resolvedOrigin;
+    if (!findChunkIndex(centerSection, worldUBO, resolvedIndex, resolvedOrigin) || resolvedIndex != int(chunkIndex) ||
+        any(notEqual(resolvedOrigin, centerOrigin))) {
+        clearLightNeighborhood(chunkIndex);
+        return;
+    }
+
+    int validCount = 0;
+    float totalLightCount = 0.0;
+    for (int z = -ADV_RESTIR_EMISSION_SIZE_XZ; z <= ADV_RESTIR_EMISSION_SIZE_XZ; ++z) {
+        for (int y = -ADV_RESTIR_EMISSION_SIZE_Y; y <= ADV_RESTIR_EMISSION_SIZE_Y; ++y) {
+            for (int x = -ADV_RESTIR_EMISSION_SIZE_XZ; x <= ADV_RESTIR_EMISSION_SIZE_XZ; ++x) {
+                ivec3 section = centerSection + ivec3(x, y, z);
+                if (!isRestirSectionWithinPlayerRange(section, worldUBO)) { continue; }
+                int neighborIndex;
+                ivec3 neighborOrigin;
+                if (!findChunkIndex(section, worldUBO, neighborIndex, neighborOrigin)) { continue; }
+                ChunkLights neighbor = chunkLights[neighborIndex];
+                if (!matchesChunkLights(neighbor, neighborOrigin) || !hasChunkLights(neighbor)) { continue; }
+                totalLightCount += float(getChunkLightCount(neighbor));
+                ++validCount;
+            }
+        }
+    }
+    if (validCount <= 0 || totalLightCount <= 1e-8) {
+        clearLightNeighborhood(chunkIndex);
+        return;
+    }
+
+    chunkLightNeighborhoods[chunkIndex].packedHeader = uvec4(uint(validCount), 0u, 0u, 0u);
+    int writeIndex = 0;
+    float cumulativeProbability = 0.0;
+    for (int z = -ADV_RESTIR_EMISSION_SIZE_XZ; z <= ADV_RESTIR_EMISSION_SIZE_XZ; ++z) {
+        for (int y = -ADV_RESTIR_EMISSION_SIZE_Y; y <= ADV_RESTIR_EMISSION_SIZE_Y; ++y) {
+            for (int x = -ADV_RESTIR_EMISSION_SIZE_XZ; x <= ADV_RESTIR_EMISSION_SIZE_XZ; ++x) {
+                ivec3 section = centerSection + ivec3(x, y, z);
+                if (!isRestirSectionWithinPlayerRange(section, worldUBO)) { continue; }
+                int neighborIndex;
+                ivec3 neighborOrigin;
+                if (!findChunkIndex(section, worldUBO, neighborIndex, neighborOrigin)) { continue; }
+                ChunkLights neighbor = chunkLights[neighborIndex];
+                if (!matchesChunkLights(neighbor, neighborOrigin) || !hasChunkLights(neighbor)) { continue; }
+                float probability = float(getChunkLightCount(neighbor)) / totalLightCount;
+                cumulativeProbability =
+                    writeIndex + 1 == validCount ? 1.0 : min(cumulativeProbability + probability, 1.0);
+                chunkLightNeighborhoods[chunkIndex].entries[writeIndex] =
+                    ChunkLightNeighborhoodEntry(uint(neighborIndex), probability, cumulativeProbability);
+                ++writeIndex;
+            }
+        }
+    }
+}

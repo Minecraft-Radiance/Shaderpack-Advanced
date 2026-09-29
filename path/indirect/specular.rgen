@@ -1,0 +1,71 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef USE_SHARC
+#    define USE_SHARC 0
+#endif
+#ifndef SHARC_QUERY
+#    define SHARC_QUERY 0
+#endif
+#if USE_SHARC
+#    extension GL_EXT_shader_atomic_int64 : require
+#endif
+
+#include "scene/resources.glsl"
+#include "core/checkerboard.glsl"
+#include "path/state.glsl"
+#include "path/indirect/lobes.glsl"
+#include "path/indirect/queue.glsl"
+#include "lighting/shadow/payload.glsl"
+#include "lighting/bsdf.glsl"
+#include "environment/parameters.glsl"
+#include "lighting/cache/query.glsl"
+#include "path/indirect/surface.glsl"
+#include "scene/materials/portal.glsl"
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(location = 0) rayPayloadEXT HitPayload hitPayload;
+layout(location = 1) rayPayloadEXT ShadowPayload pathShadowPayload;
+
+layout(set = 5, binding = ADV_SKY_RADIANCE_BINDING) uniform samplerCube skyRadianceTexture;
+layout(set = 5, binding = ADV_BLUE_NOISE_BINDING) uniform sampler2D blueNoiseTexture;
+layout(set = 5, binding = ADV_SPECULAR_RADIANCE_BINDING, rgba16f) writeonly uniform image2D specularRadianceImage;
+layout(set = 5, binding = ADV_SPECULAR_HIT_DISTANCE_BINDING, r32f) writeonly uniform image2D specularHitDistanceImage;
+layout(set = 5,
+       binding = ADV_SPECULAR_DIRECTION_MOMENT_BINDING,
+       rgba16f) writeonly uniform image2D specularDirectionMomentImage;
+
+#include "environment/sky.glsl"
+#include "environment/cloud/shade.glsl"
+
+#ifndef ADV_RAY_FLAGS
+#    define ADV_RAY_FLAGS 0x200u
+#endif
+#ifndef ADV_PATH_SURFACE_MISS_INDEX
+#    define ADV_PATH_SURFACE_MISS_INDEX 1
+#endif
+#ifndef ADV_PATH_SHADOW_MISS_INDEX
+#    define ADV_PATH_SHADOW_MISS_INDEX 0
+#endif
+
+#define ADV_SUN_SHADOW_PAYLOAD pathShadowPayload
+#define ADV_SUN_SHADOW_PAYLOAD_LOCATION 1
+#include "lighting/shadow/trace.glsl"
+#include "path/indirect/specular.glsl"
+
+void main() {
+    ivec2 flatExtent = ivec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    ivec2 flatPixel = loadIndirectRayPixel(gl_LaunchIDEXT.x, true);
+    CheckerCoordinate checker = flatToChecker(flatPixel, flatExtent);
+    if (!checker.isValid) { return; }
+    SpecularPath primary = loadSpecularPath(checker.packedPixel);
+    shadeSpecular(checker.packedPixel, flatExtent, checker, primary);
+}

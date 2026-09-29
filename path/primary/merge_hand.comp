@@ -1,0 +1,41 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "core/bindings.glsl"
+#include "core/checkerboard.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 5, binding = ADV_PRIMARY_HIT_IDENTITY_BINDING, rgba32ui) uniform uimage2D primaryHitIdentityImage;
+layout(set = 5, binding = ADV_PRIMARY_HIT_BARY_DEPTH_BINDING, rg32ui) uniform uimage2D primaryHitBaryDepthImage;
+layout(set = 5, binding = ADV_PRIMARY_MOTION_BINDING, rg32f) uniform image2D primaryMotionImage;
+
+layout(set = 5, binding = ADV_HAND_HIT_IDENTITY_BINDING, rgba32ui) readonly uniform uimage2D handHitIdentityImage;
+layout(set = 5, binding = ADV_HAND_HIT_BARY_DEPTH_BINDING, rgba32ui) readonly uniform uimage2D handHitBaryDepthImage;
+layout(set = 5, binding = ADV_HAND_MOTION_BINDING, rg32f) readonly uniform image2D handMotionImage;
+
+const uint PRIMARY_SURFACE_VALID_BIT = 0x80000000u;
+
+bool handHitIsValid(uvec4 identity) {
+    return (identity.x & PRIMARY_SURFACE_VALID_BIT) != 0u && uintBitsToFloat(identity.w) > 0.0 &&
+           !isnan(uintBitsToFloat(identity.w)) && !isinf(uintBitsToFloat(identity.w));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 packedExtent = imageSize(primaryHitIdentityImage);
+    if (any(greaterThanEqual(pixel, packedExtent))) { return; }
+
+    ivec2 flatExtent = ivec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    CheckerCoordinate checker = checkerToFlat(pixel, flatExtent);
+    if (!checker.isValid) { return; }
+
+    uvec4 handIdentity = imageLoad(handHitIdentityImage, checker.flatPixel);
+    if (!handHitIsValid(handIdentity)) { return; }
+
+    uvec4 mergedBaryDepth = imageLoad(handHitBaryDepthImage, checker.flatPixel);
+    handIdentity.x |= imageLoad(primaryHitIdentityImage, pixel).x & 0x20000000u;
+    imageStore(primaryHitIdentityImage, pixel, handIdentity);
+    imageStore(primaryHitBaryDepthImage, pixel, mergedBaryDepth);
+    imageStore(primaryMotionImage, pixel, imageLoad(handMotionImage, checker.flatPixel));
+}

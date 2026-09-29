@@ -1,6 +1,12 @@
 #ifndef TEXT_MODE_GLSL
 #define TEXT_MODE_GLSL
 
+const uint TEXT_MATERIAL_BIT = 1u << 7u;
+
+uint getPostTextMode(uint packedData) {
+    return (packedData >> 8u) & 0xFu;
+}
+
 const uint POST_TEXT_MODE_BACKGROUND = 1u;
 const uint POST_TEXT_MODE_INTENSITY = 2u;
 const uint POST_TEXT_MODE_RGBA = 3u;

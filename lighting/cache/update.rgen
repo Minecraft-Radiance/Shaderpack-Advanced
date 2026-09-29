@@ -1,0 +1,197 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef USE_SHARC
+#    define USE_SHARC 0
+#endif
+#if USE_SHARC
+#    extension GL_EXT_shader_atomic_int64 : require
+#    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#    extension GL_EXT_shader_16bit_storage : enable
+#endif
+
+#include "scene/resources.glsl"
+#include "path/state.glsl"
+#include "lighting/shadow/payload.glsl"
+#include "lighting/bsdf.glsl"
+#include "environment/parameters.glsl"
+#include "lighting/cache/query.glsl"
+#include "path/indirect/surface.glsl"
+#include "path/indirect/scattering.glsl"
+#include "environment/celestial.glsl"
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(set = 5, binding = ADV_SKY_RADIANCE_BINDING) uniform samplerCube skyRadianceTexture;
+
+#include "environment/sky.glsl"
+#include "environment/cloud/shade.glsl"
+
+layout(location = 0) rayPayloadEXT HitPayload sharcHitPayload;
+layout(location = 1) rayPayloadEXT ShadowPayload sharcShadowPayload;
+
+#ifndef ADV_SHARC_SURFACE_MISS_INDEX
+#    define ADV_SHARC_SURFACE_MISS_INDEX 1u
+#endif
+#ifndef ADV_SHARC_SHADOW_MISS_INDEX
+#    define ADV_SHARC_SHADOW_MISS_INDEX 0u
+#endif
+
+const float ADV_SHARC_TRACE_DISTANCE = 1000.0;
+const float ADV_SHARC_RAY_EPSILON = 0.001;
+
+#define ADV_SUN_SHADOW_PAYLOAD sharcShadowPayload
+#define ADV_SUN_SHADOW_PAYLOAD_LOCATION 1
+#include "lighting/shadow/trace.glsl"
+
+uint sharcTraceMask(uint bounce) {
+    uint playerMask = worldUBO.isFirstPerson != 0u && bounce == 0u ? 0u : PLAYER_MASK;
+    return WORLD_MASK | playerMask | FISHING_BOBBER_MASK;
+}
+
+vec3 sharcPrimaryDirection(ivec2 pixel, vec2 resolution) {
+    vec2 pixelCenter = vec2(pixel) + 0.5 + worldUBO.cameraJitter;
+    vec2 ndc = pixelCenter / resolution * 2.0 - 1.0;
+    vec4 viewPoint = worldUBO.cameraProjMatInv * vec4(ndc, 0.0, 1.0);
+    if (!isFinite(viewPoint) || abs(viewPoint.w) <= 1e-8) { return vec3(0.0, 0.0, -1.0); }
+    viewPoint /= viewPoint.w;
+    return normalize(vec3(worldUBO.cameraEffectedViewMatInv * vec4(viewPoint.xyz, 0.0)), vec3(0.0, 0.0, -1.0));
+}
+
+vec3 sharcOffsetOrigin(vec3 position, vec3 normal, vec3 direction) {
+    float side = dot(normal, direction) >= 0.0 ? 1.0 : -1.0;
+    return position + normal * (side * 0.0002);
+}
+
+vec3 sharcDirectSun(Surface surface, vec3 incomingDirection, uint currentMedium) {
+    vec3 lightDirection;
+    vec3 lightRadiance;
+    float lightScale;
+    getCelestialIndirectLight(lightDirection, lightRadiance, lightScale);
+    if (worldUBO.skyType != 1u || lightScale <= 1e-6) { return vec3(0.0); }
+
+    bool isStartingUnderwater = currentMedium == ADV_MEDIUM_WATER;
+    vec3 underwaterDirection = lightDirection;
+    if (isStartingUnderwater) { underwaterDirection = underwaterDirectionToLight(lightDirection); }
+    uint mask = WORLD_MASK | CLOUD_MASK | BOAT_WATER_MASK | PLAYER_MASK;
+    vec3 shadowDirection = isStartingUnderwater ? underwaterDirection : lightDirection;
+    if (dot(surface.geometryNormal, shadowDirection) <= 0.0) { return vec3(0.0); }
+    vec3 parallaxOrigin;
+    vec3 parallaxNormal;
+    if (!resolveSurfaceParallaxExit(surface, shadowDirection, parallaxOrigin, parallaxNormal)) { return vec3(0.0); }
+    vec3 origin = sharcOffsetOrigin(parallaxOrigin, parallaxNormal, shadowDirection);
+    SunShadowTrace shadow =
+        traceSunShadow(origin, lightDirection, underwaterDirection, isStartingUnderwater, ADV_SHARC_TRACE_DISTANCE,
+                       ADV_SHADOW_FLAG_DISABLE_PARALLAX, mask, 0x200u, uint(ADV_SHARC_SHADOW_MISS_INDEX));
+    if (shadow.reachedLight == 0u) { return vec3(0.0); }
+    shadow.transmission *= cloudLightVisibility(surface.position + vec3(worldUBO.cameraPos.xyz), lightDirection,
+                                                max(ADV_CLOUD_LIGHT_STEPS, 1), 0.175);
+
+    DirectBrdf brdf =
+        evaluateDirectBrdf(surface.shadingNormal, shadowDirection, -incomingDirection, surface.f0, surface.roughness);
+    vec3 surfaceDiffuseAlbedo = diffuseAlbedo(surface.albedo, surface.metallic);
+    return sanitizeRadiance(brdf.diffuse * surfaceDiffuseAlbedo * lightRadiance * shadow.transmission);
+}
+
+PathIndirectSample sampleSharcSurface(
+    Surface surface, vec3 direction, uint currentMedium, inout uint glassExteriorMedium, inout uint seed) {
+    HitGeometry geometry = invalidHitGeometry();
+    geometry.isValid = surface.isValid;
+    geometry.position = surface.position;
+    geometry.geometryNormal = surface.geometryNormal;
+    geometry.outwardNormal = surface.outwardGeometryNormal;
+    geometry.isFrontFace = surface.isFrontFace;
+    SurfaceMaterial material = invalidSurfaceMaterial();
+    material.isValid = surface.isValid;
+    material.shadingNormal = surface.shadingNormal;
+    material.albedo = surface.albedo;
+    material.f0 = surface.f0;
+    material.emission = surface.emission;
+    material.transmissionColor = surface.transmissionColor;
+    material.transmission = surface.transmission;
+    material.roughness = surface.roughness;
+    material.metallic = surface.metallic;
+    material.ior = surface.ior;
+    material.opacity = surface.opacity;
+    material.medium = surface.medium;
+    material.isCloud = surface.isCloud;
+    material.isWater = surface.isWater;
+    return sampleIndirectSurface(geometry, material, direction, currentMedium, glassExteriorMedium, seed);
+}
+
+void main() {
+#if USE_SHARC && SHARC_UPDATE
+    ivec2 updatePixel = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 updateResolution = ivec2(gl_LaunchSizeEXT.xy);
+    uint downsampleFactor = max(sharcConfig.updateDownsampleFactor, 1u);
+    ivec2 fullResolution = updateResolution * ivec2(downsampleFactor);
+    uint blockHash = xxhash32(uvec3(uint(updatePixel.x), uint(updatePixel.y), sharcConfig.frameIndex ^ worldUBO.seed));
+    ivec2 selectedOffset =
+        ivec2(int(blockHash % downsampleFactor), int((blockHash / downsampleFactor) % downsampleFactor));
+    ivec2 pixel = updatePixel * ivec2(downsampleFactor) + selectedOffset;
+    if (any(greaterThanEqual(pixel, fullResolution))) { return; }
+
+    vec2 resolution = vec2(fullResolution);
+    vec3 origin = worldUBO.cameraEffectedViewMatInv[3].xyz;
+    vec3 direction = sharcPrimaryDirection(pixel, resolution);
+    float coneSpread =
+        coneSpreadFromFov(fovYFromProj(worldUBO.cameraProjMat), fovXFromProj(worldUBO.cameraProjMat), resolution);
+    float coneWidth = 0.0;
+    uint currentMedium = isCameraUnderwater(skyUBO.cameraSubmersionType) ? ADV_MEDIUM_WATER : ADV_MEDIUM_AIR;
+    uint glassExteriorMedium = currentMedium;
+    uint seed = xxhash32(uvec3(uint(pixel.x), uint(pixel.y), sharcConfig.frameIndex ^ worldUBO.seed));
+
+    SharcParameters parameters = makeSharcParameters();
+    SharcState sharcState;
+    SharcInit(sharcState);
+
+    for (uint bounce = 0u; bounce < ADV_PATH_RAY_BUDGET; ++bounce) {
+        resetHit(sharcHitPayload, coneWidth, coneSpread, ADV_TRACE_ROLE_SECONDARY_SPECULAR);
+        uint rayFlags = 0x200u | (currentMedium == ADV_MEDIUM_AIR ? gl_RayFlagsCullBackFacingTrianglesEXT : 0u);
+        traceRayEXT(topLevelAS, rayFlags, sharcTraceMask(bounce), 1, 1, uint(ADV_SHARC_SURFACE_MISS_INDEX), origin,
+                    bounce == 0u ? ADV_SHARC_RAY_EPSILON : 0.0, direction, ADV_SHARC_TRACE_DISTANCE, 0);
+
+        if (!isHitValid(sharcHitPayload)) {
+            SharcSetThroughput(sharcState, segmentTransmittance(currentMedium, ADV_SHARC_TRACE_DISTANCE));
+            vec3 environment = shadeIndirectCloud(origin, direction, calculateIndirectSkyRadiance(direction));
+            SharcUpdateMiss(parameters, sharcState, sanitizeRadiance(environment));
+            break;
+        }
+
+        Surface surface;
+        if (!decodeSurface(sharcHitPayload, origin, direction, false, surface) || !surface.isValid) { break; }
+
+        if (!isCacheCategorySupported(surface.category) || !isCacheInstanceSupported(surface.instanceMask)) { break; }
+        SharcSetThroughput(sharcState, segmentTransmittance(currentMedium, surface.rayDistance));
+        vec3 surfaceDiffuseAlbedo = diffuseAlbedo(surface.albedo, surface.metallic);
+        vec3 localRadiance = surface.emission * max(float(ADV_INDIRECT_LIGHT_STRENGTH), 0.0) +
+                             surfaceDiffuseAlbedo * ADV_ENVIRONMENT_AMBIENT +
+                             sharcDirectSun(surface, direction, currentMedium);
+        localRadiance = sanitizeRadiance(localRadiance);
+
+        SharcHitData hitData;
+        hitData.positionWorld = surface.position + vec3(worldUBO.cameraPos.xyz);
+        hitData.normalWorld = surface.geometryNormal;
+        bool isAccepted = SharcUpdateHit(parameters, sharcState, hitData, localRadiance, rand(seed));
+        if (!isAccepted) { break; }
+
+        PathIndirectSample next = sampleSharcSurface(surface, direction, currentMedium, glassExteriorMedium, seed);
+        if (!next.isValid) { break; }
+        SharcSetThroughput(sharcState, next.throughput);
+        vec3 nextDirection = next.direction;
+        coneWidth += surface.rayDistance * coneSpread;
+        vec3 parallaxOrigin;
+        vec3 parallaxNormal;
+        if (!resolveSurfaceParallaxExit(surface, nextDirection, parallaxOrigin, parallaxNormal)) { break; }
+        origin = sharcOffsetOrigin(parallaxOrigin, parallaxNormal, nextDirection);
+        direction = nextDirection;
+        currentMedium = next.medium;
+        coneSpread = max(coneSpread, 0.1 * next.segmentRoughness * next.segmentRoughness);
+    }
+#endif
+}

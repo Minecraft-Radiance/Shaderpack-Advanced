@@ -1,0 +1,99 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#ifndef ADV_VOLUME_INDIRECT_PING_INPUT
+#    define ADV_VOLUME_INDIRECT_PING_INPUT true
+#endif
+#ifndef ADV_GI_BLUR_AXIS_X
+#    define ADV_GI_BLUR_AXIS_X 1
+#endif
+
+#include "common/shared.hpp"
+
+layout(set = 2, binding = 0) uniform VolumeWorldUniform {
+    WorldUBO worldUBO;
+};
+layout(set = 2, binding = 1) uniform VolumeLastWorldUniform {
+    WorldUBO lastWorldUBO;
+};
+layout(set = 2, binding = 2) uniform VolumeSkyUniform {
+    SkyUBO skyUBO;
+};
+
+#include "volume/froxel.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 5, binding = ADV_VOLUME_INDIRECT_A_STORAGE_BINDING, rgba16f) uniform image3D volumeIndirectAImage;
+layout(set = 5, binding = ADV_VOLUME_INDIRECT_B_STORAGE_BINDING, rgba16f) uniform image3D volumeIndirectBImage;
+layout(set = 5, binding = ADV_VOLUME_INDIRECT_BLUR_BINDING, rgba16f) uniform image3D volumeIndirectBlurImage;
+
+vec4 loadVolumeBlurInput(ivec3 coordinate) {
+#if ADV_GI_BLUR_AXIS_X
+    return ADV_VOLUME_INDIRECT_PING_INPUT ? imageLoad(volumeIndirectBImage, coordinate) :
+                                            imageLoad(volumeIndirectAImage, coordinate);
+#else
+    return imageLoad(volumeIndirectBlurImage, coordinate);
+#endif
+}
+
+void storeVolumeBlurOutput(ivec3 coordinate, vec4 volumeSample) {
+#if ADV_GI_BLUR_AXIS_X
+    imageStore(volumeIndirectBlurImage, coordinate, volumeSample);
+#else
+    if (ADV_VOLUME_INDIRECT_PING_INPUT) {
+        imageStore(volumeIndirectBImage, coordinate, volumeSample);
+    } else {
+        imageStore(volumeIndirectAImage, coordinate, volumeSample);
+    }
+#endif
+}
+
+void accumulateVolumeBlurSample(ivec3 coordinate,
+                                ivec3 extent,
+                                bool isUnderwater,
+                                inout vec3 radianceSum,
+                                inout float historySum,
+                                inout float weightSum) {
+    if (any(lessThan(coordinate, ivec3(0))) || any(greaterThanEqual(coordinate, extent))) { return; }
+    vec4 sampleValue = loadVolumeBlurInput(coordinate);
+    if (!isVolumeFinite(sampleValue.rgb) || !isVolumeHistoryMediumCompatible(sampleValue.w, isUnderwater)) { return; }
+    float weight = volumeHistorySampleWeight(sampleValue.w);
+    radianceSum += max(sampleValue.rgb, vec3(0.0)) * weight;
+    historySum += volumeDecodeHistory(sampleValue.w) * weight;
+    weightSum += weight;
+}
+
+void main() {
+    ivec3 coordinate = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 extent = ADV_VOLUME_INDIRECT_EXTENT;
+    if (any(greaterThanEqual(coordinate, extent))) { return; }
+
+    bool isUnderwater = isCameraUnderwater(skyUBO.cameraSubmersionType);
+    vec4 center = loadVolumeBlurInput(coordinate);
+    float centerHistory = isVolumeHistoryMediumCompatible(center.w, isUnderwater) ? volumeDecodeHistory(center.w) : 0.0;
+    float radiusFactor = clamp((100.0 - centerHistory) / 120.0, 0.0, 1.0);
+    int radius = 1 + int(radiusFactor * 5.0);
+    ivec3 stepDirection = ADV_GI_BLUR_AXIS_X != 0 ? ivec3(1, 0, 0) : ivec3(0, 1, 0);
+
+    vec3 radianceSum = vec3(0.0);
+    float historySum = 0.0;
+    float weightSum = 0.0;
+    accumulateVolumeBlurSample(coordinate, extent, isUnderwater, radianceSum, historySum, weightSum);
+    for (int offset = 1; offset <= 6; ++offset) {
+        if (offset > radius) { break; }
+        accumulateVolumeBlurSample(coordinate + stepDirection * offset, extent, isUnderwater, radianceSum, historySum,
+                                   weightSum);
+        accumulateVolumeBlurSample(coordinate - stepDirection * offset, extent, isUnderwater, radianceSum, historySum,
+                                   weightSum);
+    }
+
+    if (weightSum <= 0.0) {
+        storeVolumeBlurOutput(coordinate, vec4(0.0, 0.0, 0.0, volumeEncodeHistory(0.0, isUnderwater)));
+        return;
+    }
+    vec3 radiance = radianceSum / weightSum;
+    float historyLength = historySum / weightSum;
+    storeVolumeBlurOutput(
+        coordinate, vec4(clamp(radiance, vec3(0.0), vec3(65504.0)), volumeEncodeHistory(historyLength, isUnderwater)));
+}

@@ -1,0 +1,96 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#define ADV_SCENE_RESOURCES_NO_PREVIOUS_GEOMETRY
+#include "scene/resources.glsl"
+#include "util/vista.glsl"
+#include "scene/materials/alpha.glsl"
+#include "lighting/shadow/payload.glsl"
+#include "scene/materials/labpbr.glsl"
+#include "scene/materials/any_hit.glsl"
+#include "util/alpha_mode.glsl"
+#include "util/ray_cone.glsl"
+
+#ifndef ADV_CLOUD_MODE
+#    define ADV_CLOUD_MODE 1u
+#endif
+
+layout(location = 0) rayPayloadInEXT ShadowPayload shadowPayload;
+hitAttributeEXT vec2 shadowHitAttributes;
+
+void main() {
+    if (isVistaCovered(worldUBO, gl_InstanceCustomIndexEXT, shadowHitAttributes)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    if (isShadowPayloadWaterProbe(shadowPayload)) {
+        if (isAnyHitWaterProbeSurface(shadowHitAttributes)) {
+            shadowPayload.flags |= ADV_SHADOW_FLAG_WATER_SURFACE_FOUND;
+            shadowPayload.waterSurfaceHitT = min(shadowPayload.waterSurfaceHitT, gl_HitTEXT);
+        } else {
+            ignoreIntersectionEXT;
+        }
+        return;
+    }
+
+    bool shouldEvaluateParallax = !shouldShadowPayloadDisableParallax(shadowPayload);
+    AnyHitMaterial material = loadAnyHitMaterial(shadowHitAttributes, 0.0, 0.0, shouldEvaluateParallax, true);
+
+    if (!material.isCovered) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    if (material.isWater) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    if (material.isCloud) {
+        if (ADV_CLOUD_MODE != 1u) {
+            ignoreIntersectionEXT;
+            return;
+        }
+        shadowPayload.transmission *= vec3(1.0 - 0.666);
+        if (max(shadowPayload.transmission.r, max(shadowPayload.transmission.g, shadowPayload.transmission.b)) <=
+            1e-3) {
+            shadowPayload.transmission = vec3(0.0);
+            terminateRayEXT;
+        } else {
+            ignoreIntersectionEXT;
+        }
+        return;
+    }
+
+    if (material.isShadowTransparent) {
+        if (gl_HitKindEXT == gl_HitKindBackFacingTriangleEXT) {
+            ignoreIntersectionEXT;
+            return;
+        }
+        vec3 transmission = material.shadowTransmission;
+        shadowPayload.transmission *= transmission;
+        float maximum =
+            max(shadowPayload.transmission.r, max(shadowPayload.transmission.g, shadowPayload.transmission.b));
+        if (maximum <= 1e-3) {
+            shadowPayload.transmission = vec3(0.0);
+            terminateRayEXT;
+        } else {
+            ignoreIntersectionEXT;
+        }
+        return;
+    }
+
+    if (shouldEvaluateParallax && !material.doesParallaxOcclude) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    if ((material.instanceMask & PLAYER_MASK) != 0u) { shadowPayload.flags |= ADV_SHADOW_FLAG_DYNAMIC_BLOCKER; }
+    shadowPayload.blockerHitT = min(shadowPayload.blockerHitT, gl_HitTEXT);
+    shadowPayload.transmission = vec3(0.0);
+    terminateRayEXT;
+}

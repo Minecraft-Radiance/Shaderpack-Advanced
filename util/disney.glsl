@@ -22,20 +22,6 @@
  * SOFTWARE.
  */
 
-/* References:
- * [1] [Physically Based Shading at Disney]
- * https://media.disneyanimation.com/uploads/production/publication_asset/48/asset/s2012_pbs_disney_brdf_notes_v3.pdf
- * [2] [Extending the Disney BRDF to a BSDF with Integrated Subsurface Scattering]
- * https://blog.selfshadow.com/publications/s2015-shading-course/burley/s2015_pbs_disney_bsdf_notes.pdf [3] [The Disney
- * BRDF Explorer] https://github.com/wdas/brdf/blob/main/src/brdfs/disney.brdf [4] [Miles Macklin's implementation]
- * https://github.com/mmacklin/tinsel/blob/master/src/disney.h [5] [Simon Kallweit's project report]
- * http://simon-kallweit.me/rendercompo2015/report/ [6] [Microfacet Models for Refraction through Rough Surfaces]
- * https://www.cs.cornell.edu/~srm/publications/EGSR07-btdf.pdf [7] [Sampling the GGX Distribution of Visible Normals]
- * https://jcgt.org/published/0007/04/01/paper.pdf [8] [Pixar's Foundation for Materials]
- * https://graphics.pixar.com/library/PxrMaterialsCourse2017/paper.pdf [9] [Mitsuba 3]
- * https://github.com/mitsuba-renderer/mitsuba3
- */
-
 /*
  * Modifications:
  * - Copyright (c) 2026 Radiance
@@ -133,7 +119,6 @@ float Luminance(vec3 c) {
 float DielectricFresnel(float cosThetaI, float eta) {
     float sinThetaTSq = eta * eta * (1.0f - cosThetaI * cosThetaI);
 
-    // Total internal reflection
     if (sinThetaTSq > 1.0) return 1.0;
 
     float cosThetaT = sqrt(max(1.0 - sinThetaTSq, 0.0));
@@ -164,7 +149,6 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
     vec3 localV = ToLocal(T, B, N, V);
     vec3 localL = ToLocal(T, B, N, L);
 
-    // in / out
     float eta = (dot(V, N) > 0.0) ? (1.0 / mat.ior) : mat.ior;
 
     vec3 localH;
@@ -175,12 +159,10 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
 
     if (localH.z < 0.0) localH = -localH;
 
-    // Model weights
     float dielectricWeight = (1.0 - mat.metallic) * (1.0 - mat.transmission);
     float metalWeight = mat.metallic;
     float glassWeight = (1.0 - mat.metallic) * mat.transmission;
 
-    // Lobe probabilities
     float schlickWeight = SchlickWeight(abs(localV.z));
 
     float diffPr = dielectricWeight * Luminance(mat.albedo);
@@ -198,7 +180,6 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
     float tmpPdf = 0.0;
     float VDotH = abs(dot(localV, localH));
 
-    // Diffuse
     if (diffPr > 0.0 && reflect) {
         float LDotH = dot(localL, localH);
         float Rr = 2.0 * mat.roughness * LDotH * LDotH;
@@ -207,7 +188,6 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
         float Fretro = Rr * (FL + FV + FL * FV * (Rr - 1.0));
         float Fd = (1.0 - 0.5 * FL) * (1.0 - 0.5 * FV);
 
-        // Fake subsurface
         float Fss90 = 0.5 * Rr;
         float Fss = mix(1.0, Fss90, FL) * mix(1.0, Fss90, FV);
         float ss = 1.25 * (Fss * (1.0 / (localL.z + localV.z) - 0.5) + 0.5);
@@ -215,14 +195,13 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
         vec3 diffuseColor = INV_PI * mat.albedo * mix(Fd + Fretro, ss, mat.subSurface);
 
         f += diffuseColor * dielectricWeight;
-        pdf += (localL.z * INV_PI) * diffPr; // Cosine weighted PDF
+        pdf += (localL.z * INV_PI) * diffPr;
     }
 
-    // Dielectric Reflection
     if (dielectricPr > 0.0 && reflect) {
         float F = DielectricFresnel(VDotH, 1.0 / mat.ior);
 
-        float a = mat.roughness * mat.roughness; // Isotropic
+        float a = mat.roughness * mat.roughness;
         float D = GTR2Aniso(localH.z, localH.x, localH.y, a, a);
         float G1 = SmithGAniso(abs(localV.z), localV.x, localV.y, a, a);
         float G2 = G1 * SmithGAniso(abs(localL.z), localL.x, localL.y, a, a);
@@ -234,7 +213,6 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
         pdf += tmpPdf * dielectricPr;
     }
 
-    // Metallic Reflection
     if (metalPr > 0.0 && reflect) {
         vec3 FMetal = mix(mat.albedo, vec3(1.0), SchlickWeight(VDotH));
 
@@ -250,7 +228,6 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
         pdf += tmpPdf * metalPr;
     }
 
-    // Glass / Specular BSDF
     if (glassPr > 0.0) {
         float F = DielectricFresnel(VDotH, eta);
         float a = mat.roughness * mat.roughness;
@@ -277,7 +254,7 @@ vec3 DisneyEval(LabPBRMat mat, vec3 V, vec3 N, vec3 L, out float pdf) {
         }
     }
 
-    return f * abs(localL.z); // Cosine term applied
+    return f * abs(localL.z);
 }
 
 vec3 DisneySample(LabPBRMat mat, vec3 V, vec3 N, out vec3 L, out float pdf, inout uint seed, out uint lobeType) {
@@ -312,24 +289,23 @@ vec3 DisneySample(LabPBRMat mat, vec3 V, vec3 N, out vec3 L, out float pdf, inou
 
     vec3 localL;
 
-    if (r3 < cdf0) { // Diffuse
+    if (r3 < cdf0) {
         lobeType = 0;
         localL = CosineSampleHemisphere(r1, r2);
-    } else if (r3 < cdf2) { // Dielectric + Metallic Reflection
+    } else if (r3 < cdf2) {
         lobeType = 1;
-        float a = mat.roughness * mat.roughness; // Isotropic
+        float a = mat.roughness * mat.roughness;
         vec3 localH = SampleGGXVNDF(localV, a, a, r1, r2);
         if (localH.z < 0.0) localH = -localH;
         localL = normalize(reflect(-localV, localH));
-    } else { // Glass
-        float a = mat.roughness * mat.roughness; // Isotropic
+    } else {
+        float a = mat.roughness * mat.roughness;
         vec3 localH = SampleGGXVNDF(localV, a, a, r1, r2);
         if (localH.z < 0.0) localH = -localH;
 
         float eta = (localV.z > 0.0) ? (1.0 / mat.ior) : mat.ior;
         float F = DielectricFresnel(abs(dot(localV, localH)), eta);
 
-        // Rescale random number for reuse
         float r_glass = (r3 - cdf2) / (1.0 - cdf2 + 1e-5);
 
         if (r_glass < F) {
@@ -392,8 +368,8 @@ vec3 DisneySampleSpecularRefraction(LabPBRMat mat, vec3 V, vec3 N, out vec3 L, o
     pdf = G1 * max(0.0, VDotH) * D * jacobian / absVZ;
     if (pdf <= 1e-6) { return vec3(0.0); }
 
-    vec3 transColor = pow(max(mat.albedo, vec3(0.0)), vec3(0.5)) * (1.0 - F) * D * G2 *
-                      abs(dot(localV, localH)) * jacobian * (eta * eta) / max(abs(localL.z * localV.z), 1e-6);
+    vec3 transColor = pow(max(mat.albedo, vec3(0.0)), vec3(0.5)) * (1.0 - F) * D * G2 * abs(dot(localV, localH)) *
+                      jacobian * (eta * eta) / max(abs(localL.z * localV.z), 1e-6);
     vec3 f = transColor * ((1.0 - mat.metallic) * mat.transmission);
 
     L = ToWorld(T, B, N, localL);

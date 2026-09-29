@@ -1,0 +1,83 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#define ADV_SCENE_RESOURCES_NO_PREVIOUS_GEOMETRY
+#include "scene/resources.glsl"
+#include "util/vista.glsl"
+#include "lighting/shadow/payload.glsl"
+#include "scene/materials/any_hit.glsl"
+#include "lighting/shadow/water.glsl"
+
+#ifndef ADV_CLOUD_MODE
+#    define ADV_CLOUD_MODE 1u
+#endif
+
+layout(location = 0) rayPayloadInEXT ShadowPayload restirShadowPayload;
+hitAttributeEXT vec2 restirShadowHitAttributes;
+
+void restirShadowTerminateIfOpaque() {
+    float maximum = max(restirShadowPayload.transmission.r,
+                        max(restirShadowPayload.transmission.g, restirShadowPayload.transmission.b));
+    if (maximum <= 1e-3) {
+        restirShadowPayload.transmission = vec3(0.0);
+        terminateRayEXT;
+    } else {
+        ignoreIntersectionEXT;
+    }
+}
+
+void main() {
+    if (isVistaCovered(worldUBO, gl_InstanceCustomIndexEXT, restirShadowHitAttributes)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    bool shouldEvaluateParallax = !shouldShadowPayloadDisableParallax(restirShadowPayload);
+    AnyHitMaterial material = loadAnyHitMaterial(restirShadowHitAttributes, 0.0, 0.0, shouldEvaluateParallax, true);
+    if (!material.isCovered) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    if (material.isWater) {
+        vec3 waterSurfacePosition = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+        vec3 waterTransmission = waterSunTransmission(waterSurfacePosition, gl_WorldRayDirectionEXT, gl_HitTEXT);
+        if (any(isnan(waterTransmission)) || any(isinf(waterTransmission))) { waterTransmission = vec3(0.0); }
+        restirShadowPayload.transmission *= clamp(waterTransmission, vec3(0.0), vec3(ADV_SHADOW_MAX_TRANSMISSION));
+        restirShadowTerminateIfOpaque();
+        return;
+    }
+
+    if (material.isCloud) {
+        if (ADV_CLOUD_MODE != 1u) {
+            ignoreIntersectionEXT;
+            return;
+        }
+        restirShadowPayload.transmission *= vec3(1.0 - 0.666);
+        restirShadowTerminateIfOpaque();
+        return;
+    }
+
+    if (material.isShadowTransparent) {
+        if (gl_HitKindEXT == gl_HitKindBackFacingTriangleEXT) {
+            ignoreIntersectionEXT;
+            return;
+        }
+        vec3 surfaceTransmission = material.shadowTransmission;
+        restirShadowPayload.transmission *= surfaceTransmission;
+        restirShadowTerminateIfOpaque();
+        return;
+    }
+
+    if (shouldEvaluateParallax && !material.doesParallaxOcclude) {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    restirShadowPayload.blockerHitT = min(restirShadowPayload.blockerHitT, gl_HitTEXT);
+    restirShadowPayload.transmission = vec3(0.0);
+    terminateRayEXT;
+}

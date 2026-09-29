@@ -24,6 +24,7 @@ const uint rayCaptureSurfaceBit = 1u << 16u;
 const uint raySurfaceCacheWrittenBit = 1u << 17u;
 const uint raySurfaceCacheTargetSecondaryBit = 1u << 18u;
 const uint rayIndirectVolumetricCloudBit = 1u << 19u;
+const uint rayFirstContinuationHitBit = 1u << 20u;
 
 ivec3 rayMaterialStateCoord(int layer) {
     return ivec3(ivec2(gl_LaunchIDEXT.xy), layer);
@@ -94,8 +95,8 @@ bool rayCaptureSurface(MainRay ray) {
 }
 
 void raySetSurfaceCacheWritten(inout MainRay ray, bool enabled) {
-    ray.stateBits = enabled ? (ray.stateBits | raySurfaceCacheWrittenBit) :
-                              (ray.stateBits & ~raySurfaceCacheWrittenBit);
+    ray.stateBits =
+        enabled ? (ray.stateBits | raySurfaceCacheWrittenBit) : (ray.stateBits & ~raySurfaceCacheWrittenBit);
 }
 
 bool raySurfaceCacheWritten(MainRay ray) {
@@ -112,12 +113,21 @@ bool raySurfaceCacheTargetSecondary(MainRay ray) {
 }
 
 void raySetIndirectVolumetricCloud(inout MainRay ray, bool enabled) {
-    ray.stateBits = enabled ? (ray.stateBits | rayIndirectVolumetricCloudBit) :
-                              (ray.stateBits & ~rayIndirectVolumetricCloudBit);
+    ray.stateBits =
+        enabled ? (ray.stateBits | rayIndirectVolumetricCloudBit) : (ray.stateBits & ~rayIndirectVolumetricCloudBit);
 }
 
 bool rayUseIndirectVolumetricCloud(MainRay ray) {
     return (ray.stateBits & rayIndirectVolumetricCloudBit) != 0u;
+}
+
+void raySetFirstContinuationHit(inout MainRay ray, bool enabled) {
+    ray.stateBits =
+        enabled ? (ray.stateBits | rayFirstContinuationHitBit) : (ray.stateBits & ~rayFirstContinuationHitBit);
+}
+
+bool rayFirstContinuationHit(MainRay ray) {
+    return (ray.stateBits & rayFirstContinuationHitBit) != 0u;
 }
 
 void raySetLobeType(inout MainRay ray, uint lobeType) {
@@ -135,13 +145,13 @@ void rayClearMaterial(inout MainRay ray) {
 }
 
 void rayStoreMaterial(inout MainRay ray,
-                       vec4 albedoValue,
-                       vec3 f0,
-                       float roughness,
-                       float metallic,
-                       float transmission,
-                       float ior,
-                       float emission) {
+                      vec4 albedoValue,
+                      vec3 f0,
+                      float roughness,
+                      float metallic,
+                      float transmission,
+                      float ior,
+                      float emission) {
     imageStore(rayMaterialStateImage, rayMaterialStateCoord(0), albedoValue);
     imageStore(rayMaterialStateImage, rayMaterialStateCoord(1), vec4(f0, roughness));
     imageStore(rayMaterialStateImage, rayMaterialStateCoord(2), vec4(metallic, transmission, ior, emission));

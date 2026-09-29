@@ -51,13 +51,14 @@ vec4 sampleBilinear(sampler2D tex, vec2 uv, int lod, bool isSRGB) {
     return mix(c0, c1, fracPart.y);
 }
 
-vec4 samplePBRTexture(sampler2D tex,
-                      vec2 uv,
-                      vec2 atlasUvMin,
-                      vec2 atlasUvMax,
-                      float lod,
-                      uint samplingMode) {
-    int lodLevel = clamp(int(floor(lod)), 0, max(textureQueryLevels(tex) - 1, 0));
+vec4 samplePBRTexture(sampler2D tex, vec2 uv, vec2 atlasUvMin, vec2 atlasUvMax, float lod, uint samplingMode) {
+    int levelCount = max(textureQueryLevels(tex), 1);
+    ivec2 baseSize = textureSize(tex, 0);
+    if (baseSize.x <= 0 || baseSize.y <= 0) { return vec4(0.0); }
+
+    vec2 atlasPixels = max(abs(atlasUvMax - atlasUvMin) * vec2(baseSize), vec2(1.0));
+    int maxSafeLevel = int(floor(log2(max(min(atlasPixels.x, atlasPixels.y), 1.0))));
+    int lodLevel = clamp(int(floor(lod)), 0, min(levelCount - 1, maxSafeLevel));
     ivec2 size = textureSize(tex, lodLevel);
     if (size.x <= 0 || size.y <= 0) { return vec4(0.0); }
 
@@ -67,6 +68,17 @@ vec4 samplePBRTexture(sampler2D tex,
     } else {
         return sampleBilinear(tex, clampedUv, lodLevel, false);
     }
+}
+
+vec4 samplePBRSpecularTexture(sampler2D tex, vec2 uv, vec2 atlasUvMin, vec2 atlasUvMax, float lod, uint samplingMode) {
+    vec4 specular = samplePBRTexture(tex, uv, atlasUvMin, atlasUvMax, lod, samplingMode);
+    ivec2 size = textureSize(tex, 0);
+    if (size.x <= 0 || size.y <= 0) { return specular; }
+
+    vec2 clampedUv = clampUvToRect(uv, atlasUvMin, atlasUvMax, size);
+    ivec2 texel = clampTexelCoord(ivec2(floor(clampedUv * vec2(size))), size);
+    specular.a = sampleTexture(tex, texel, 0, false).a;
+    return specular;
 }
 
 #endif

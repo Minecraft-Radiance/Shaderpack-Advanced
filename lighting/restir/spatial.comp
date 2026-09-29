@@ -1,0 +1,197 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#include "scene/resources.glsl"
+#include "lighting/restir/resampling.glsl"
+
+struct RestirSpatialResult {
+    bool isSurfaceValid;
+    bool isReservoirValid;
+    vec3 worldPosition;
+    vec3 normal;
+    float worldPerPixel;
+    uvec4 reservoirHeader;
+    uvec4 reservoirBody;
+};
+
+RestirSpatialResult invalidRestirSpatialResult() {
+    RestirSpatialResult result;
+    result.isSurfaceValid = false;
+    result.isReservoirValid = false;
+    result.worldPosition = vec3(0.0);
+    result.normal = vec3(0.0, 1.0, 0.0);
+    result.worldPerPixel = 0.0;
+    result.reservoirHeader = uvec4(0u);
+    result.reservoirBody = uvec4(0u);
+    return result;
+}
+
+bool doesRestirSpatialTargetMatch(ivec2 currentPixel,
+                                  ivec2 donorPixel,
+                                  vec3 currentWorldPosition,
+                                  vec3 currentNormal,
+                                  RestirSurfaceKey donorSurface,
+                                  float worldPerPixel) {
+    if (!donorSurface.isValid || dot(donorSurface.normal, currentNormal) <= ADV_RESTIR_SPATIAL_NORMAL_THRESHOLD) {
+        return false;
+    }
+
+    vec3 worldDelta = donorSurface.worldPosition - currentWorldPosition;
+    float planeDistance = max(abs(dot(worldDelta, currentNormal)), abs(dot(worldDelta, donorSurface.normal)));
+    if (planeDistance > ADV_RESTIR_SPATIAL_PLANE_TOLERANCE) { return false; }
+
+    vec3 tangentNormal = brdfNormalize(currentNormal + donorSurface.normal, currentNormal);
+    vec3 tangentDelta = worldDelta - tangentNormal * dot(worldDelta, tangentNormal);
+    float pixelDistanceSquared = max(dot(vec2(donorPixel - currentPixel), vec2(donorPixel - currentPixel)), 1.0);
+    float minimumToleranceSquared = ADV_RESTIR_SPATIAL_MIN_TANGENT_TOLERANCE * ADV_RESTIR_SPATIAL_MIN_TANGENT_TOLERANCE;
+    float footprint = worldPerPixel * ADV_RESTIR_SPATIAL_TANGENT_PIXEL_SCALE;
+    float footprintToleranceSquared = footprint * footprint * pixelDistanceSquared;
+    return dot(tangentDelta, tangentDelta) <= max(minimumToleranceSquared, footprintToleranceSquared);
+}
+
+RestirSpatialResult resampleRestirSpatial(ivec2 pixel, ivec2 resolution) {
+    RestirSpatialResult result = invalidRestirSpatialResult();
+    bool isInputPing = bool(ADV_RESTIR_FRAME_PING_INPUT);
+    RestirTarget target;
+    if (!loadRestirTarget(pixel, resolution, target)) {
+        storeSpatialRestirReservoir(pixel, emptyRestirReservoir());
+        return result;
+    }
+
+    RestirReservoir current = loadTemporalRestirReservoir(pixel, isInputPing);
+    float confidenceCap = restirConfidenceCap();
+    bool shouldBoostDisocclusion = current.confidence <= 1.25;
+    int spatialSampleCount = int(ADV_RESTIR_SPATIAL_SAMPLES);
+    if (shouldBoostDisocclusion) {
+        spatialSampleCount = max(spatialSampleCount, int(ADV_RESTIR_SPATIAL_DISOCCLUSION_SAMPLES));
+    }
+
+    float worldPerPixel = restirWorldPerPixel(length(target.position), resolution);
+    vec3 currentWorldPosition = target.position + vec3(worldUBO.cameraPos.xyz);
+    result.isSurfaceValid = true;
+    result.worldPosition = currentWorldPosition;
+    result.normal = target.geometryNormal;
+    result.worldPerPixel = worldPerPixel;
+    uint mergeSeed = xxhash32(uvec3(uint(pixel.x), uint(pixel.y), worldUBO.seed ^ 0x53a71a11u));
+    RestirReservoirMerge merge = makeRestirReservoirMerge();
+    float sampleCount = 0.0;
+    if (current.isValid && current.confidence > 1e-8 && current.targetFunction > 1e-8) {
+        sampleCount += current.confidence;
+        mergeRestirReservoir(merge, current, current.targetFunction, current.confidence, mergeSeed);
+    }
+
+    uint donorPatternSeed = xxhash32(uvec3(uint(pixel.x), uint(pixel.y), 0x53a71a11u));
+    float donorRadiusJitter = rand(donorPatternSeed);
+    float donorRotation = 2.0 * ADV_BRDF_PI * rand(donorPatternSeed);
+    float inverseSpatialSampleCount = 1.0 / float(max(spatialSampleCount, 1));
+    for (int sampleIndex = 0; sampleIndex < spatialSampleCount; ++sampleIndex) {
+        float radius = sqrt((float(sampleIndex) + donorRadiusJitter) * inverseSpatialSampleCount) *
+                       float(ADV_RESTIR_SPATIAL_RADIUS);
+        float angle = donorRotation + float(sampleIndex) * 2.39996322972865332;
+        ivec2 donorPixel = pixel + ivec2(round(vec2(cos(angle), sin(angle)) * radius));
+        if (any(lessThan(donorPixel, ivec2(0))) || any(greaterThanEqual(donorPixel, resolution)) ||
+            all(equal(donorPixel, pixel))) {
+            continue;
+        }
+#if ADV_RESTIR_RESOLUTION_MODE == 0
+        if (bool(ADV_RESTIR_HISTORY_READY) && !isRestirPixelActive(donorPixel)) { continue; }
+#endif
+
+        RestirReservoirHeader donorHeader = loadTemporalRestirReservoirHeader(donorPixel, isInputPing);
+        if (!donorHeader.isValid || donorHeader.confidence <= 1e-8) { continue; }
+        float donorMergeCount = 0.0;
+        if (shouldBoostDisocclusion) {
+            donorMergeCount = min(donorHeader.confidence, ADV_RESTIR_SPATIAL_BOOST_NAIVE_MERGE_COUNT);
+        } else if (donorHeader.confidence > 1.0) {
+            float fade =
+                clamp((donorHeader.confidence - 1.0) / max(ADV_RESTIR_SPATIAL_NAIVE_M_THRESHOLD - 1.0, 1e-8), 0.0, 1.0);
+            donorMergeCount = min(donorHeader.confidence * fade, ADV_RESTIR_SPATIAL_STABLE_MERGE_COUNT);
+        }
+        if (donorMergeCount <= 1e-8) { continue; }
+
+        RestirSurfaceKey donorSurface = loadRestirSurfaceKey(donorPixel, isInputPing);
+        if (!doesRestirSpatialTargetMatch(pixel, donorPixel, currentWorldPosition, target.geometryNormal, donorSurface,
+                                          worldPerPixel)) {
+            continue;
+        }
+        RestirReservoir donor = loadTemporalRestirReservoirBody(donorPixel, isInputPing, donorHeader);
+        if (!isRestirReuseStable(target, donor, donorSurface.worldPosition)) { continue; }
+        float donorTargetFunction = evaluateRestirTarget(target, donor.radiance, donor.point, donor.normal);
+        if (donorTargetFunction <= 1e-8) { continue; }
+
+        sampleCount += donorMergeCount;
+        mergeRestirReservoir(merge, donor, donorTargetFunction, donorMergeCount, mergeSeed);
+    }
+
+    RestirReservoir spatial = sampleCount > 1e-8 ?
+                                  finishRestirReservoirMerge(merge, sampleCount, min(sampleCount, confidenceCap)) :
+                                  emptyRestirReservoir();
+    result.isReservoirValid = packRestirReservoir(spatial, result.reservoirHeader, result.reservoirBody);
+    storeSpatialRestirLayer(pixel, 0, result.reservoirHeader);
+    storeSpatialRestirLayer(pixel, 1, result.reservoirBody);
+    return result;
+}
+
+void main() {
+    ivec2 resolution = ivec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    ivec2 dispatchPixel = ivec2(gl_GlobalInvocationID.xy);
+#if ADV_RESTIR_RESOLUTION_MODE == 1
+    if (any(greaterThanEqual(dispatchPixel, resolution))) { return; }
+    resampleRestirSpatial(dispatchPixel, resolution);
+#else
+    ivec2 dispatchExtent = restirCheckerboardDispatchExtent(resolution);
+    if (any(greaterThanEqual(dispatchPixel, dispatchExtent))) { return; }
+
+    RestirSpatialResult activeResult = invalidRestirSpatialResult();
+    ivec2 activePixel = restirActivePixel(dispatchPixel);
+    if (activePixel.x < resolution.x) { activeResult = resampleRestirSpatial(activePixel, resolution); }
+
+    ivec2 inactivePixel = restirInactivePixel(dispatchPixel);
+    if (inactivePixel.x >= resolution.x) { return; }
+    if (!bool(ADV_RESTIR_HISTORY_READY)) {
+        resampleRestirSpatial(inactivePixel, resolution);
+        return;
+    }
+    bool reusedActive = false;
+    bool isInputPing = bool(ADV_RESTIR_FRAME_PING_INPUT);
+    RestirTarget inactiveTarget;
+    bool hasInactiveTarget = loadRestirTarget(inactivePixel, resolution, inactiveTarget);
+    if (activeResult.isSurfaceValid && activeResult.isReservoirValid) {
+        RestirSurfaceKey inactiveSurface = loadRestirSurfaceKey(inactivePixel, isInputPing);
+        if (hasInactiveTarget &&
+            doesRestirSpatialTargetMatch(activePixel, inactivePixel, activeResult.worldPosition, activeResult.normal,
+                                         inactiveSurface, activeResult.worldPerPixel)) {
+            RestirReservoirHeader activeHeader = decodeRestirReservoirHeader(activeResult.reservoirHeader);
+            RestirReservoir paired = decodeRestirReservoirBody(activeResult.reservoirBody, activeHeader);
+            float pairedTarget =
+                isRestirReuseStable(inactiveTarget, paired, activeResult.worldPosition) ?
+                    evaluateRestirTarget(inactiveTarget, paired.radiance, paired.point, paired.normal) :
+                    0.0;
+            if (pairedTarget > 1e-8) {
+                paired.targetFunction = pairedTarget;
+                paired.confidence = min(paired.confidence, ADV_RESTIR_CHECKER_REUSE_CONFIDENCE_CAP);
+                uvec4 pairedHeader;
+                uvec4 pairedBody;
+                reusedActive = packRestirReservoir(paired, pairedHeader, pairedBody);
+                if (reusedActive) {
+                    storeSpatialRestirLayer(inactivePixel, 0, pairedHeader);
+                    storeSpatialRestirLayer(inactivePixel, 1, pairedBody);
+                }
+            }
+        }
+    }
+    if (!reusedActive) {
+        RestirReservoir inactive = loadTemporalRestirReservoir(inactivePixel, isInputPing);
+        if (!inactive.isValid && hasInactiveTarget) {
+            inactive = generateInitialRestirReservoir(inactiveTarget, inactivePixel, worldUBO.seed ^ 0x4f1bbcdcu,
+                                                      max(uint(ADV_RESTIR_INITIAL_SAMPLES), 1u));
+        }
+        storeSpatialRestirReservoir(inactivePixel, inactive);
+    }
+#endif
+}

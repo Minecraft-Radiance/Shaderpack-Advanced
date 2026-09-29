@@ -12,8 +12,8 @@ vec2 computeCameraMotionVector(mat4 prevMVP, vec2 pixelCenter, vec4 motionOrigin
 }
 
 mat3 buildMirrorMatrix(vec3 normal) {
-    return mat3(-2.0 * (vec3(normal.x) * normal) + vec3(1.0, 0.0, 0.0), //
-                -2.0 * (vec3(normal.y) * normal) + vec3(0.0, 1.0, 0.0), //
+    return mat3(-2.0 * (vec3(normal.x) * normal) + vec3(1.0, 0.0, 0.0),
+                -2.0 * (vec3(normal.y) * normal) + vec3(0.0, 1.0, 0.0),
                 -2.0 * (vec3(normal.z) * normal) + vec3(0.0, 0.0, 1.0));
 }
 

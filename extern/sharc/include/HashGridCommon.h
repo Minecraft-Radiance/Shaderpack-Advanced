@@ -71,7 +71,7 @@ uint HashGridHashJenkins32(uint a)
 
 uint HashGridHash32(HashGridKey hashKey)
 {
-    return HashGridHashJenkins32(uint((hashKey >> 0) & 0xFFFFFFFF)) ^ HashGridHashJenkins32(uint((hashKey >> 32) & 0xFFFFFFFF));
+    return HashGridHashJenkins32(uint((hashKey >> uint64_t(0)) & 0xFFFFFFFF)) ^ HashGridHashJenkins32(uint((hashKey >> uint64_t(32)) & 0xFFFFFFFF));
 }
 
 uint HashGridGetBaseSlot(const HashGridKey hashKey, uint capacity)
@@ -110,10 +110,10 @@ HashGridKey HashGridComputeSpatialHash(float3 samplePosition, float3 sampleNorma
 {
     uint4 gridPosition = uint4(HashGridCalculatePositionLog(samplePosition, gridParameters));
 
-    HashGridKey hashKey = ((uint64_t(gridPosition.x) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 0)) |
-                          ((uint64_t(gridPosition.y) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 1)) |
-                          ((uint64_t(gridPosition.z) & HASH_GRID_POSITION_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 2)) |
-                          ((uint64_t(gridPosition.w) & HASH_GRID_LEVEL_BIT_MASK) << (HASH_GRID_POSITION_BIT_NUM * 3));
+    HashGridKey hashKey = ((uint64_t(gridPosition.x) & HASH_GRID_POSITION_BIT_MASK) << uint64_t(HASH_GRID_POSITION_BIT_NUM * 0)) |
+                          ((uint64_t(gridPosition.y) & HASH_GRID_POSITION_BIT_MASK) << uint64_t(HASH_GRID_POSITION_BIT_NUM * 1)) |
+                          ((uint64_t(gridPosition.z) & HASH_GRID_POSITION_BIT_MASK) << uint64_t(HASH_GRID_POSITION_BIT_NUM * 2)) |
+                          ((uint64_t(gridPosition.w) & HASH_GRID_LEVEL_BIT_MASK) << uint64_t(HASH_GRID_POSITION_BIT_NUM * 3));
 
 #if HASH_GRID_USE_NORMALS
     uint normalBits =
@@ -121,7 +121,7 @@ HashGridKey HashGridComputeSpatialHash(float3 samplePosition, float3 sampleNorma
         (sampleNormal.y + HASH_GRID_NORMAL_BIAS >= 0 ? 0 : 2) +
         (sampleNormal.z + HASH_GRID_NORMAL_BIAS >= 0 ? 0 : 4);
 
-    hashKey |= (uint64_t(normalBits) << (HASH_GRID_POSITION_BIT_NUM * 3 + HASH_GRID_LEVEL_BIT_NUM));
+    hashKey |= (uint64_t(normalBits) << uint64_t(HASH_GRID_POSITION_BIT_NUM * 3 + HASH_GRID_LEVEL_BIT_NUM));
 #endif // HASH_GRID_USE_NORMALS
 
     return hashKey;
@@ -133,16 +133,16 @@ float3 HashGridGetPositionFromKey(const HashGridKey hashKey, HashGridParameters 
     const int signMask     = ~((1 << HASH_GRID_POSITION_BIT_NUM) - 1);
 
     int3 gridPosition;
-    gridPosition.x = int((hashKey >> (HASH_GRID_POSITION_BIT_NUM * 0)) & HASH_GRID_POSITION_BIT_MASK);
-    gridPosition.y = int((hashKey >> (HASH_GRID_POSITION_BIT_NUM * 1)) & HASH_GRID_POSITION_BIT_MASK);
-    gridPosition.z = int((hashKey >> (HASH_GRID_POSITION_BIT_NUM * 2)) & HASH_GRID_POSITION_BIT_MASK);
+    gridPosition.x = int((hashKey >> uint64_t(HASH_GRID_POSITION_BIT_NUM * 0)) & HASH_GRID_POSITION_BIT_MASK);
+    gridPosition.y = int((hashKey >> uint64_t(HASH_GRID_POSITION_BIT_NUM * 1)) & HASH_GRID_POSITION_BIT_MASK);
+    gridPosition.z = int((hashKey >> uint64_t(HASH_GRID_POSITION_BIT_NUM * 2)) & HASH_GRID_POSITION_BIT_MASK);
 
     // Fix negative coordinates
     gridPosition.x = (gridPosition.x & signBit) != 0 ? gridPosition.x | signMask : gridPosition.x;
     gridPosition.y = (gridPosition.y & signBit) != 0 ? gridPosition.y | signMask : gridPosition.y;
     gridPosition.z = (gridPosition.z & signBit) != 0 ? gridPosition.z | signMask : gridPosition.z;
 
-    uint   gridLevel        = uint((hashKey >> HASH_GRID_POSITION_BIT_NUM * 3) & HASH_GRID_LEVEL_BIT_MASK);
+    uint   gridLevel        = uint((hashKey >> uint64_t(HASH_GRID_POSITION_BIT_NUM * 3)) & HASH_GRID_LEVEL_BIT_MASK);
     float  voxelSize        = HashGridGetVoxelSize(gridLevel, gridParameters);
     float3 samplePosition   = (gridPosition + 0.5f) * voxelSize;
 

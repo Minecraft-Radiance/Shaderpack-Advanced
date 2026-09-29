@@ -1,0 +1,38 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef USE_SHARC
+#    define USE_SHARC 0
+#endif
+
+#if USE_SHARC
+#    extension GL_EXT_shader_atomic_int64 : require
+#    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#    extension GL_EXT_shader_16bit_storage : enable
+#endif
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "lighting/cache/sharc.glsl"
+
+void main() {
+#if USE_SHARC
+    const uint resolveInvocation = gl_GlobalInvocationID.x;
+    if (resolveInvocation >= sharcConfig.resolveEntryCount) { return; }
+
+    const uint entryIndex = sharcConfig.resolveBaseEntry + resolveInvocation;
+    if (entryIndex >= sharcConfig.capacity) { return; }
+
+    SharcResolveParameters resolveParameters;
+    resolveParameters.cameraPositionPrev = sharcConfig.cameraPositionPrev.xyz;
+    resolveParameters.accumulationFrameNum = sharcConfig.accumulationFrameNum;
+    resolveParameters.staleFrameNumMax = sharcConfig.staleFrameNumMax;
+    resolveParameters.frameIndex = sharcConfig.frameIndex;
+
+    SharcResolveEntry(entryIndex, makeSharcParameters(), resolveParameters);
+#endif
+}

@@ -1,0 +1,278 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_control_flow_attributes : require
+
+#define ADV_PATH_RECORD_WRITE
+#define ADV_PRIMARY_HIT_IDENTITY_READ_WRITE
+#include "scene/resources.glsl"
+#include "core/checkerboard.glsl"
+#include "path/state.glsl"
+#include "scene/materials/portal.glsl"
+#include "environment/parameters.glsl"
+
+layout(set = 1, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(location = 0) rayPayloadEXT HitPayload hitPayload;
+
+layout(set = 3, binding = 1, rgba8) writeonly uniform image2D primaryDiffuseAlbedoImage;
+layout(set = 3, binding = 2, rgba8) writeonly uniform image2D primarySpecularAlbedoImage;
+layout(set = 3, binding = 3, rgba16f) writeonly uniform image2D primaryNormalRoughnessImage;
+layout(set = 3, binding = 4, rg16f) writeonly uniform image2D primaryMotionVectorImage;
+layout(set = 3, binding = 5, r16f) writeonly uniform image2D primaryLinearDepthImage;
+layout(set = 3, binding = 6, r16f) writeonly uniform image2D primaryFirstHitDepthImage;
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+layout(set = 3, binding = 21, rgba16f) writeonly uniform image2D directLightGuideNormalRoughnessImage;
+layout(set = 3, binding = 22, rgba16f) writeonly uniform image2D directLightGuideMotionDepthImage;
+#endif
+
+layout(set = 3, binding = 15, rgba16f) writeonly uniform image2D pathBaseEmissionImage;
+
+#ifndef ADV_RAY_FLAGS
+#    define ADV_RAY_FLAGS 0x200u
+#endif
+#ifndef ADV_PATH_SURFACE_MISS_INDEX
+#    define ADV_PATH_SURFACE_MISS_INDEX 0
+#endif
+#define ADV_PRIMARY_MISS_INDEX ADV_PATH_SURFACE_MISS_INDEX
+#include "path/primary/trace.glsl"
+
+#include "path/primary/terminal.glsl"
+#include "path/primary/branch.glsl"
+#include "path/primary/guides.glsl"
+
+void main() {
+    ivec2 packedPixel = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 flatExtent = ivec2(int(ADV_RENDER_WIDTH), int(ADV_RENDER_HEIGHT));
+    if (!isPackedCoordinateInBounds(packedPixel, flatExtent)) { return; }
+
+    CheckerCoordinate checker = checkerToFlat(packedPixel, flatExtent);
+    if (!checker.isValid) {
+        storePathRecord(packedPixel, invalidPathRecord());
+        return;
+    }
+
+    vec3 cameraOrigin;
+    vec3 primaryDirection;
+    float coneSpread;
+    buildPrimaryCameraRay(checker.flatPixel, flatExtent, cameraOrigin, primaryDirection, coneSpread);
+
+    vec3 rayOrigin = cameraOrigin;
+    vec3 rayDirection = primaryDirection;
+    float coneWidth = 0.0;
+    f16vec3 throughput = f16vec3(1.0);
+    uint currentMedium = isCameraUnderwater(skyUBO.cameraSubmersionType) ? ADV_MEDIUM_WATER : ADV_MEDIUM_AIR;
+    float16_t currentIor = float16_t(mediumIor(currentMedium, ADV_GLASS_IOR));
+    bool currentGlassIsHand = false;
+    uint splitBounce = 0u;
+    uint bounceCount = 0u;
+    float pathLength = 0.0;
+    bool isSky = false;
+    bool hasPassedTransparent = false;
+    PathTerminal terminal = invalidPathTerminal();
+    uint terminalSurfaceMedium = currentMedium;
+    uint terminalCategory = ADV_HIT_CATEGORY_DEFAULT;
+    uint firstInterfaceFlags = 0u;
+    uint firstInterfaceSurfaceHash = 0u;
+    float firstInterfacePreviousDepth = ADV_PRIMARY_TEMPORAL_INVALID_DEPTH;
+    bool shouldCaptureTransparentSpecularHitDistance = false;
+    uint terminalAction = ADV_MEDIA_ACTION_STOP;
+    float transparentSpecularHitDistance = 0.0;
+    uint rayBudgetUsed = 0u;
+    HitPayload prefetchedRefractionHit;
+    resetHit(prefetchedRefractionHit, coneWidth, coneSpread, ADV_TRACE_ROLE_PRIMARY);
+    bool isPrefetchedRefractionHitReady = false;
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+    float directLightGuideReferenceIor = max(float(currentIor), 1e-5);
+    float directLightGuideApparentPathLength = 0.0;
+#endif
+
+    float discoveryTemporalDepth = 0.0;
+    bool pathHasIndirect = true;
+    {
+        const uint bounce = 0u;
+#define ADV_PRIMARY_FIRST_SEGMENT true
+#define ADV_PRIMARY_SEGMENT_STOP                                                                                       \
+    {                                                                                                                  \
+        pathHasIndirect = false;                                                                                       \
+        break;                                                                                                         \
+    }
+#define ADV_PRIMARY_SEGMENT_CONTINUE break
+        do {
+#include "path/primary/segment.inc.glsl"
+        } while (false);
+#undef ADV_PRIMARY_FIRST_SEGMENT
+#undef ADV_PRIMARY_SEGMENT_STOP
+#undef ADV_PRIMARY_SEGMENT_CONTINUE
+    }
+    if (pathHasIndirect) {
+#define ADV_PRIMARY_FIRST_SEGMENT false
+#define ADV_PRIMARY_SEGMENT_STOP break
+#define ADV_PRIMARY_SEGMENT_CONTINUE continue
+        for (uint bounce = 1u; bounce <= ADV_PATH_RAY_BUDGET; ++bounce) {
+#include "path/primary/segment.inc.glsl"
+        }
+#undef ADV_PRIMARY_FIRST_SEGMENT
+#undef ADV_PRIMARY_SEGMENT_STOP
+#undef ADV_PRIMARY_SEGMENT_CONTINUE
+    }
+
+    PathRecord pathRecord = invalidPathRecord();
+    pathRecord.transparentSpecularHitDistance = transparentSpecularHitDistance;
+    uint flags = ADV_PATH_FLAG_VALID;
+    if (isSky) { flags |= ADV_PATH_FLAG_SKY; }
+    if (splitBounce != 0u) { flags |= ADV_PATH_FLAG_SPLIT; }
+    flags |= firstInterfaceFlags;
+    if (hasPassedTransparent) { flags |= ADV_PATH_FLAG_AFTER_TRANSPARENT; }
+    bool isFirstTransparentSplit =
+        splitBounce == 1u &&
+        (firstInterfaceFlags & (ADV_PATH_FLAG_FIRST_HIT_WATER | ADV_PATH_FLAG_FIRST_HIT_GLASS)) != 0u;
+    bool isSkyInterfaceReflection = isSky && (firstInterfaceFlags & ADV_PATH_FLAG_FIRST_INTERFACE_SPECULAR) != 0u;
+    bool usesFirstInterfaceCheckerIdentity = isFirstTransparentSplit || isSkyInterfaceReflection;
+    if (!isSky && isPathTerminalValid(terminal)) {
+        flags |= ADV_PATH_FLAG_TERMINAL_SURFACE;
+        bool isTerminalHand = hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_HAND);
+        if (isTerminalHand) { flags |= ADV_PATH_FLAG_HAND; }
+        if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_CLOUD)) { flags |= ADV_PATH_FLAG_CLOUD; }
+        if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_WATER)) { flags |= ADV_PATH_FLAG_WATER; }
+        if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_NO_REFLECT)) { flags |= ADV_PATH_FLAG_NO_REFLECT; }
+        if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_PORTAL)) { flags |= ADV_PATH_FLAG_PORTAL; }
+        bool isTerminalDynamic = !isChunkGeometryBufferIndex(terminal.identity.y);
+        if (isTerminalDynamic) { flags |= ADV_PATH_FLAG_DYNAMIC; }
+        bool useTerminalPrimitiveHash = isTerminalDynamic && !isTerminalHand;
+        flags = packPathSurfaceHash(flags, makePathSurfaceHash(terminal.identity, useTerminalPrimitiveHash));
+    }
+    if (usesFirstInterfaceCheckerIdentity) {
+        flags &= ~(ADV_PATH_SURFACE_HASH_MASK << ADV_PATH_SURFACE_HASH_SHIFT);
+        flags = packPathSurfaceHash(flags, firstInterfaceSurfaceHash);
+    }
+
+    vec3 throughput32 = vec3(throughput);
+    pathRecord.pathLength = pathLength;
+    pathRecord.throughput =
+        isFinite(throughput32) ? clamp(throughput32, vec3(0.0), vec3(ADV_PRIMARY_FP16_MAX)) : vec3(0.0);
+    pathRecord.rayDirection = rayDirection;
+    vec3 terminalEmission = vec3(0.0);
+    vec2 skyMotion = vec2(0.0);
+    if (isSky) {
+        pathRecord.position = rayOrigin + rayDirection * ADV_ENVIRONMENT_MAX_DISTANCE;
+        projectEnvironmentDirection(rayDirection, vec2(checker.flatPixel) + 0.5 + worldUBO.cameraJitter,
+                                    vec2(flatExtent), skyMotion);
+    } else if (isPathTerminalValid(terminal)) {
+        vec3 terminalAlbedo = vec3(terminal.albedo);
+        vec3 terminalF0 = vec3(terminal.f0);
+        terminalEmission = vec3(terminal.emission);
+        float terminalMetallic = float(terminal.metallic);
+        float terminalRoughness = float(terminal.roughness);
+        if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_PORTAL)) {
+            int iterations = pathTerminalCategory(terminal) == ADV_HIT_CATEGORY_END_GATEWAY ? 15 : 16;
+            terminalEmission = computeEndPortalRadiance(terminal.position, iterations);
+            terminalAlbedo = vec3(0.0);
+            terminalF0 = vec3(0.0);
+            terminalMetallic = 0.0;
+            terminalRoughness = 0.0;
+        }
+        pathRecord.position = terminal.position;
+        pathRecord.shadingNormal = vec3(terminal.shadingNormal);
+        pathRecord.roughness = terminalRoughness;
+        pathRecord.geometryNormal = vec3(terminal.geometryNormal);
+        pathRecord.albedo = terminalAlbedo;
+        pathRecord.metallic = terminalMetallic;
+        pathRecord.f0 = terminalF0;
+        vec3 previousTerminalPosition =
+            terminal.hasPreviousPosition ?
+                terminal.previousPosition :
+                terminal.position + vec3(worldUBO.cameraPos.xyz - lastWorldUBO.cameraPos.xyz);
+        vec2 terminalMotion = vec2(0.0);
+        float previousTerminalDepth;
+        bool hasTerminalTemporalProjection =
+            projectPreviousPosition(previousTerminalPosition, vec2(checker.flatPixel) + 0.5 + worldUBO.cameraJitter,
+                                    vec2(flatExtent), terminalMotion, previousTerminalDepth);
+        if (hasTerminalTemporalProjection) {
+            pathRecord.previousPathDepth = clamp(previousTerminalDepth, 0.0, ADV_PRIMARY_FP16_MAX);
+        }
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+        if (splitBounce != 0u && isFinite(directLightGuideApparentPathLength) &&
+            directLightGuideApparentPathLength > 1e-6) {
+            vec3 virtualTerminalPosition = cameraOrigin + primaryDirection * directLightGuideApparentPathLength;
+            vec3 cameraDelta = vec3(worldUBO.cameraPos.xyz - lastWorldUBO.cameraPos.xyz);
+            vec3 previousVirtualTerminalPosition = virtualTerminalPosition + cameraDelta;
+            vec2 currentPixelCenter = vec2(checker.flatPixel) + 0.5 + worldUBO.cameraJitter;
+            vec2 virtualTerminalMotion;
+            float previousVirtualTerminalDepth;
+            vec2 virtualTerminalCurrentPixel;
+            float virtualTerminalDepth;
+            if (isFinite(virtualTerminalPosition) && isFinite(previousVirtualTerminalPosition) &&
+                projectPreviousPosition(previousVirtualTerminalPosition, currentPixelCenter, vec2(flatExtent),
+                                        virtualTerminalMotion, previousVirtualTerminalDepth) &&
+                projectCurrentPosition(virtualTerminalPosition, vec2(flatExtent), virtualTerminalCurrentPixel,
+                                       virtualTerminalDepth)) {
+                virtualTerminalMotion -= virtualTerminalCurrentPixel - currentPixelCenter;
+
+                if (terminal.hasPreviousPosition && hasTerminalTemporalProjection) {
+                    vec3 staticPreviousTerminalPosition = terminal.position + cameraDelta;
+                    vec2 staticTerminalMotion;
+                    float staticPreviousTerminalDepth;
+                    if (projectPreviousPosition(staticPreviousTerminalPosition, currentPixelCenter, vec2(flatExtent),
+                                                staticTerminalMotion, staticPreviousTerminalDepth)) {
+                        vec2 terminalObjectMotion = terminalMotion - staticTerminalMotion;
+                        if (isFinite(terminalObjectMotion)) { virtualTerminalMotion += terminalObjectMotion; }
+                    }
+                }
+
+                vec3 directLightGuideNormal = vec3(terminal.shadingNormal);
+                float directLightGuideRoughness = clamp(float(terminal.roughness), 0.0, 1.0);
+                vec2 directLightGuideMotion = virtualTerminalMotion;
+                float directLightGuideDepth = clamp(virtualTerminalDepth, 0.0, ADV_PRIMARY_FP16_MAX);
+                float directLightGuidePreviousDepth = clamp(previousVirtualTerminalDepth, 0.0, ADV_PRIMARY_FP16_MAX);
+                bool directLightGuideValid = isFinite(directLightGuideMotion) &&
+                                             isFinite(directLightGuidePreviousDepth) &&
+                                             directLightGuideDepth < ADV_PRIMARY_FP16_MAX * 0.9 &&
+                                             directLightGuidePreviousDepth < ADV_PRIMARY_FP16_MAX * 0.9;
+                storePrimaryDirectGuide(checker.flatPixel, directLightGuideNormal, directLightGuideRoughness,
+                                        directLightGuideMotion, directLightGuideDepth, directLightGuidePreviousDepth,
+                                        directLightGuideValid, directLightGuideValid);
+            }
+        }
+#endif
+        if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_PARALLAX)) {
+            uint parallaxHitFlags = 0u;
+            if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_FRONT_FACE)) {
+                parallaxHitFlags |= ADV_PARALLAX_HIT_FLAG_FRONT_FACE;
+            }
+            if (hasPathTerminalFlag(terminal, ADV_TERMINAL_FLAG_PARALLAX_SIDE_WALL)) {
+                parallaxHitFlags |= ADV_PARALLAX_HIT_FLAG_SIDE_WALL;
+            }
+            pathRecord.parallax.hit = uvec4(terminal.identity, parallaxHitFlags);
+            pathRecord.parallax.continuousUv = terminal.parallaxContinuousUv;
+            pathRecord.parallax.depth = max(terminal.parallaxDepth, 0.0);
+            pathRecord.parallax.maxDepthWorld = max(terminal.parallaxMaxDepthWorld, 0.0);
+        }
+        pathRecord.opacity = float(terminal.opacity);
+        if (any(greaterThan(terminalEmission, vec3(1e-6)))) { flags |= ADV_PATH_FLAG_EMISSIVE; }
+    }
+    if ((firstInterfaceFlags & ADV_PATH_FLAG_FIRST_HIT_VALID) != 0u) {
+        pathRecord.previousPathDepth = firstInterfacePreviousDepth;
+    }
+    if (isFirstTransparentSplit && isSky) { pathRecord.previousPathDepth = -max(firstInterfacePreviousDepth, 1e-3); }
+
+    pathRecord.key = packPathKey(flags, splitBounce, bounceCount, rayBudgetUsed, currentMedium, terminalAction,
+                                 terminalSurfaceMedium, terminalCategory);
+    terminalEmission =
+        isFinite(terminalEmission) ? clamp(terminalEmission, vec3(0.0), vec3(ADV_PRIMARY_FP16_MAX)) : vec3(0.0);
+    imageStore(pathBaseEmissionImage, checker.flatPixel, vec4(terminalEmission, pathRecord.previousPathDepth));
+
+    if ((firstInterfaceFlags & ADV_PATH_FLAG_FIRST_HIT_VALID) == 0u) {
+        storePrimaryGuides(checker.flatPixel, vec4(0.0), vec4(0.0), vec4(0.0, 0.0, 0.0, 1.0),
+                           isFinite(skyMotion) ? skyMotion : vec2(0.0), ADV_PRIMARY_FP16_MAX);
+#if MCVR_USE_NRD_SEPARATE_DIRECT
+        imageStore(directLightGuideNormalRoughnessImage, checker.flatPixel, vec4(0.0));
+        imageStore(directLightGuideMotionDepthImage, checker.flatPixel, vec4(0.0));
+#endif
+    }
+    storePathRecord(packedPixel, pathRecord);
+}
